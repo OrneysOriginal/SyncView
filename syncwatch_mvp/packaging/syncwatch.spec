@@ -14,13 +14,15 @@ if not vlc_source_raw:
 vlc_source = Path(vlc_source_raw).resolve()
 if not vlc_source.exists():
     raise SystemExit(f"VLC runtime directory does not exist: {vlc_source}")
+if sys.platform == "win32":
+    for name in ("libvlc.dll", "libvlccore.dll", "plugins"):
+        if not (vlc_source / name).exists():
+            raise SystemExit(f"Incomplete VLC runtime: missing {name}")
 
 # Bundle the complete runtime. VLC discovers codecs and outputs through plugins,
 # so copying only libvlc is insufficient.
 datas = [(str(vlc_source), "vlc")]
 hiddenimports = collect_submodules("websockets")
-
-block_cipher = None
 
 a = Analysis(
     [str(project / "src" / "main.py")],
@@ -35,7 +37,7 @@ a = Analysis(
     noarchive=False,
     optimize=1,
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
@@ -58,7 +60,6 @@ exe = EXE(
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
     strip=False,
     upx=False,

@@ -1,4 +1,4 @@
 PySide6>=6.7,<7
 python-vlc>=3.0.20123
-websockets>=12,<16
+websockets>=14,<16
 pytest>=8,<9

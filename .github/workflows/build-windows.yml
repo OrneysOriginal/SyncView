@@ -1,0 +1,62 @@
+name: Build Windows application
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Download VLC runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "https://download.videolan.org/pub/videolan/vlc/3.0.21/win64"
+          $archive = Join-Path $env:RUNNER_TEMP "vlc.zip"
+          Invoke-WebRequest "$base/vlc-3.0.21-win64.zip" -OutFile $archive
+          $checksumFile = Join-Path $env:RUNNER_TEMP "vlc.sha256"
+          Invoke-WebRequest "$base/vlc-3.0.21-win64.zip.sha256" -OutFile $checksumFile
+          $checksum = Get-Content $checksumFile -Raw
+          $expected = [regex]::Match($checksum, '[a-fA-F0-9]{64}').Value
+          if (-not $expected -or (Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) {
+              throw "VLC archive checksum mismatch"
+          }
+          Expand-Archive $archive -DestinationPath (Join-Path $env:RUNNER_TEMP "vlc")
+      - name: Build executable
+        shell: pwsh
+        run: |
+          ./syncwatch_mvp/build_tools/build_windows.ps1 -VlcDir "$env:RUNNER_TEMP/vlc/vlc-3.0.21"
+      - name: Check packaged startup
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "syncwatch_mvp/dist/SyncWatch/SyncWatch.exe").Path
+          $process = Start-Process $exe -ArgumentList "--smoke-test" -PassThru
+          if (-not $process.WaitForExit(30000)) {
+              Stop-Process -Id $process.Id -Force
+              throw "Packaged application did not exit within 30 seconds"
+          }
+          if ($process.ExitCode -ne 0) {
+              throw "Packaged startup failed: exit code $($process.ExitCode)"
+          }
+      - name: Upload application
+        uses: actions/upload-artifact@v4
+        with:
+          name: SyncWatch-Windows-x64
+          path: syncwatch_mvp/dist/SyncWatch-Windows-x64.zip
+          if-no-files-found: error
+      - name: Upload startup log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-startup-log
+          path: '~/.syncwatch/logs/syncwatch.log'
+          if-no-files-found: ignore

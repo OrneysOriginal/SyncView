@@ -13,3 +13,7 @@ __pycache__/
 *.pywz
 *.pyzw
 .pytest_cache/
+.venv/
+.venv-build/
+syncwatch_mvp/build/
+syncwatch_mvp/dist/
