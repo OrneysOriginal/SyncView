@@ -2,6 +2,12 @@ name: Build Windows application
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'New version for a draft release (e.g. v0.1.0); leave empty for build only'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -48,3 +54,52 @@ jobs:
           name: Windows-startup-log
           path: '~/.syncwatch/logs/syncwatch.log'
           if-no-files-found: ignore
+
+  release:
+    if: ${{ inputs.release_tag != '' }}
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SyncWatch-Windows-x64
+          path: release-assets
+      - name: Create draft release with Windows application
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]; then
+            echo "Use a new version tag such as v0.1.0 or v0.1.0-beta.1" >&2
+            exit 1
+          fi
+          cat > release-notes.md <<'NOTES'
+          SyncWatch — приложение для совместного просмотра локального видео.
+
+          **Скачать для Windows 10/11 x64:** `SyncWatch-Windows-x64.zip` в разделе Assets.
+
+          1. Распакуйте архив целиком.
+          2. Запустите `SyncWatch.exe` двойным щелчком.
+          3. Сохраните папку `_internal` рядом с программой.
+
+          Python и VLC включены в пакет. Отдельно устанавливать их для запуска не нужно.
+
+          Сборка проверяет запуск Qt, VLC и сетевого потока. Реальное воспроизведение
+          и синхронизация на двух компьютерах требуют отдельной проверки. Это MVP:
+          известные ограничения сессии и синхронизации описаны в `syncwatch_mvp/AUDIT.md`.
+          NOTES
+          # Create a new tag at exactly the commit that was built. Existing tags
+          # fail instead of attaching a new binary to a different source version.
+          gh api "repos/$GH_REPO/git/refs" --method POST \
+            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$SOURCE_COMMIT"
+          gh release create "$RELEASE_TAG" \
+            --repo "$GH_REPO" --verify-tag --draft \
+            --title "SyncWatch $RELEASE_TAG — Windows x64" \
+            --notes-file release-notes.md \
+            "release-assets/SyncWatch-Windows-x64.zip"
