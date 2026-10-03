@@ -46,16 +46,42 @@ Assert-NativeSuccess "Upgrading pip"
 & $Python -m pip install -r requirements-build.txt
 Assert-NativeSuccess "Installing build dependencies"
 
+$env:VLC_HOME = $VlcDir
+& $Python -c "from src.infrastructure.bundled_vlc import configure_bundled_vlc; configure_bundled_vlc(); import vlc; instance = vlc.Instance('--no-video-title-show'); assert instance is not None, 'VLC initialization failed: check matching DLLs and plugins'; instance.release()"
+Assert-NativeSuccess "Initializing source VLC runtime"
+
 $env:SYNCWATCH_VLC_DIR = $VlcDir
-& $Python -m PyInstaller --noconfirm --clean packaging\syncwatch.spec
+# Keep incomplete output out of dist. An EXE can exist before COLLECT finishes
+# copying Qt, VLC and its plugins; only publish a verified, complete package.
+$StagingRoot = Join-Path $ProjectRoot "build\windows-package"
+& $Python -m PyInstaller --noconfirm --clean --distpath $StagingRoot packaging\syncwatch.spec
 Assert-NativeSuccess "Building SyncWatch"
 
-$Executable = Join-Path $ProjectRoot "dist\SyncWatch\SyncWatch.exe"
+$StagedApp = Join-Path $StagingRoot "SyncWatch"
+$Executable = Join-Path $StagedApp "SyncWatch.exe"
 if (-not (Test-Path $Executable)) {
     throw "Build did not produce SyncWatch.exe."
 }
 
-$Zip = Join-Path $ProjectRoot "dist\SyncWatch-Windows-x64.zip"
-Remove-Item $Zip -ErrorAction SilentlyContinue
-Compress-Archive -Path "dist\SyncWatch\*" -DestinationPath $Zip
+$Process = Start-Process $Executable -ArgumentList "--smoke-test" -PassThru
+if (-not $Process.WaitForExit(30000)) {
+    Stop-Process -Id $Process.Id -Force
+    throw "Packaged application did not exit within 30 seconds. Check the startup log."
+}
+if ($Process.ExitCode -ne 0) {
+    throw "Packaged startup failed. Check $env:USERPROFILE\.syncwatch\logs\syncwatch.log"
+}
+
+$StagedZip = Join-Path $StagingRoot "SyncWatch-Windows-x64.zip"
+Compress-Archive -Path (Join-Path $StagedApp "*") -DestinationPath $StagedZip -Force
+
+$DistRoot = Join-Path $ProjectRoot "dist"
+New-Item -ItemType Directory -Path $DistRoot -Force | Out-Null
+$FinalApp = Join-Path $DistRoot "SyncWatch"
+if (Test-Path $FinalApp) {
+    Remove-Item -LiteralPath $FinalApp -Recurse -Force
+}
+Move-Item -LiteralPath $StagedApp -Destination $FinalApp
+$Zip = Join-Path $DistRoot "SyncWatch-Windows-x64.zip"
+Move-Item -LiteralPath $StagedZip -Destination $Zip -Force
 Write-Host "Created: $Zip"

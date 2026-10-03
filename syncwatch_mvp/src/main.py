@@ -27,8 +27,8 @@ def main() -> int:
         QMessageBox.critical(
             None,
             "SyncWatch",
-            "Не удалось запустить приложение. В автономной сборке libVLC "
-            f"должен находиться внутри пакета.\n\nОшибка: {exc}",
+            "Не удалось запустить приложение.\n\n"
+            f"{exc}\n\nПодробности: ~/.syncwatch/logs/syncwatch.log",
         )
         return 1
     window.resize(1100, 720)

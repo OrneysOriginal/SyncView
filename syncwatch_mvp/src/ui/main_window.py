@@ -76,7 +76,6 @@ class MainWindow(QMainWindow):
         self.network.message_received.connect(self._on_message)
         self.network.status_changed.connect(self._set_status)
         self.network.failed.connect(self._show_error)
-        self.network.start()
         self.executor = ThreadPoolExecutor(max_workers=3)
         self.command_id = 0
         self.last_command_id = 0
@@ -105,6 +104,8 @@ class MainWindow(QMainWindow):
         self._build_host()
         self._build_connect()
         self._build_player()
+        # Start background work only after VLC has initialized successfully.
+        self.network.start()
 
         self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self._refresh_player_ui)
