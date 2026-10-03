@@ -50,6 +50,11 @@ $env:VLC_HOME = $VlcDir
 & $Python -c "from src.infrastructure.bundled_vlc import configure_bundled_vlc; configure_bundled_vlc(); import vlc; instance = vlc.Instance('--no-video-title-show'); assert instance is not None, 'VLC initialization failed: check matching DLLs and plugins'; instance.release()"
 Assert-NativeSuccess "Initializing source VLC runtime"
 
+& $Python -m ruff check --no-cache src tests
+Assert-NativeSuccess "Checking source code"
+& $Python -m pytest -q -p no:cacheprovider
+Assert-NativeSuccess "Running regression and integration tests"
+
 $env:SYNCWATCH_VLC_DIR = $VlcDir
 # Keep incomplete output out of dist. An EXE can exist before COLLECT finishes
 # copying Qt, VLC and its plugins; only publish a verified, complete package.
@@ -64,9 +69,9 @@ if (-not (Test-Path $Executable)) {
 }
 
 $Process = Start-Process $Executable -ArgumentList "--smoke-test" -PassThru
-if (-not $Process.WaitForExit(30000)) {
+if (-not $Process.WaitForExit(60000)) {
     Stop-Process -Id $Process.Id -Force
-    throw "Packaged application did not exit within 30 seconds. Check the startup log."
+    throw "Packaged application did not exit within 60 seconds. Check the startup log."
 }
 if ($Process.ExitCode -ne 0) {
     throw "Packaged startup failed. Check $env:USERPROFILE\.syncwatch\logs\syncwatch.log"

@@ -11,7 +11,7 @@ from src.synchronization.drift_calculator import calculate_drift_ms, needs_corre
 
 
 def test_message_roundtrip() -> None:
-    original = Message("play", {"command_id": 1, "position_ms": 42})
+    original = Message("play", {"command_id": 1, "position_ms": 42, "execute_delay_ms": 350, "execute_at": 100.0, "media_fingerprint": "x"})
     decoded = decode_message(encode_message(original))
     assert decoded.type == "play"
     assert decoded.payload["command_id"] == 1

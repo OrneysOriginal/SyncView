@@ -13,10 +13,16 @@ __pycache__/
 *.pywz
 *.pyzw
 .pytest_cache/
+.ruff_cache/
+*.log
+.env
+.env.*
+!.env.example
 .venv/
 .venv-build/
 syncwatch_mvp/build/
 syncwatch_mvp/dist/
-/Точечный рисунок*.bmp
-/SyncWatch.exe
-/SyncWatch-Windows-*.zip
+Точечный рисунок*.bmp
+SyncWatch.exe
+SyncWatch-Windows-*.zip
+SyncWatch-macOS-*.zip

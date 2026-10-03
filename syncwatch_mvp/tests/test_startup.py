@@ -84,9 +84,10 @@ def test_screen_remains_responsive_and_window_is_created_on_gui_thread(app, tmp_
 
 
 @pytest.mark.parametrize("smoke_test", [False, True])
-def test_preparation_failure_hides_screen_and_reports_error(app, tmp_path, monkeypatch, smoke_test):
+@pytest.mark.parametrize("failure", [RuntimeError("Missing VLC plugins"), SystemExit("Missing VLC plugins")])
+def test_preparation_failure_hides_screen_and_reports_error(app, tmp_path, monkeypatch, smoke_test, failure):
     def prepare(progress):
-        raise RuntimeError("Missing VLC plugins")
+        raise failure
 
     controller = StartupController(app, tmp_path / "startup.log", prepare=prepare, smoke_test=smoke_test)
     dialogs = []

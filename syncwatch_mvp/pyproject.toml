@@ -1,3 +1,16 @@
+[project]
+name = "syncwatch"
+version = "0.2.0b1"
+description = "Shared playback of local videos over a LAN"
+requires-python = ">=3.10"
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

@@ -5,7 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QProgressBar, QVBoxLayout, QWidget
 
 
@@ -70,17 +70,17 @@ class StartupScreen(QWidget):
         super().closeEvent(event)
 
 
-def prepare_application(progress: Callable[[str], None]) -> tuple[Any, Any]:
+def prepare_application(progress: Callable[[str], None], *, smoke_test: bool = False) -> tuple[Any, Any]:
     # Heavy imports and native initialization must not block the Qt GUI loop.
     progress("Подготавливаем компоненты…")
     from src.infrastructure.bundled_vlc import configure_bundled_vlc
 
     configure_bundled_vlc()
-    from src.ui.main_window import MainWindow
     from src.player.vlc_player import create_vlc_instance
+    from src.ui.main_window import MainWindow
 
     progress("Запускаем видеоплеер…")
-    instance = create_vlc_instance()
+    instance = create_vlc_instance(*(["--vout=dummy", "--aout=dummy", "--quiet", "--stats"] if smoke_test else []))
     return MainWindow, instance
 
 
@@ -99,7 +99,7 @@ class StartupWorker(QThread):
         try:
             factory, instance = self.prepare(self.progress.emit)
             self.ready.emit(factory, instance)
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             logging.exception("Application preparation failed")
             self.failed.emit(str(exc))
 
@@ -111,7 +111,7 @@ class StartupController(QObject):
         log_path: Path,
         *,
         smoke_test: bool = False,
-        prepare: Callable = prepare_application,
+        prepare: Callable | None = None,
     ) -> None:
         super().__init__(app)
         self.app = app
@@ -120,6 +120,9 @@ class StartupController(QObject):
         self.cancelled = False
         self.window: QWidget | None = None
         self.screen = StartupScreen()
+        if prepare is None:
+            def prepare(progress):
+                return prepare_application(progress, smoke_test=smoke_test)
         self.worker = StartupWorker(prepare, self)
         self.worker.progress.connect(self.screen.set_stage)
         self.worker.ready.connect(self._ready)
@@ -152,7 +155,13 @@ class StartupController(QObject):
         self.screen.hide()
         self.app.setQuitOnLastWindowClosed(True)
         if self.smoke_test:
-            QTimer.singleShot(1000, self.window.close)
+            if hasattr(self.window, "player"):
+                from src.infrastructure.smoke_test import PlaybackSmokeTest
+
+                self.playback_check = PlaybackSmokeTest(self.app, self.window)
+                self.playback_check.start()
+            else:
+                QTimer.singleShot(1000, self.window.close)
 
     @Slot(str)
     def _failed(self, reason: str) -> None:

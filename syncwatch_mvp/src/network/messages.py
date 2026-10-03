@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -16,15 +16,18 @@ class Message:
     session_id: str = ""
     message_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     sent_at: float = field(default_factory=time.monotonic)
+    # Local transport metadata, never taken from the wire.
+    sender_id: str = ""
+    received_at: float = field(default_factory=time.monotonic)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            **self.payload,
             "type": self.type,
             "protocol_version": self.protocol_version,
             "session_id": self.session_id,
             "message_id": self.message_id,
             "sent_at": self.sent_at,
-            **self.payload,
         }
 
     @classmethod

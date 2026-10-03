@@ -10,8 +10,8 @@ from PySide6.QtWidgets import QWidget
 from src.player.interface import VideoPlayer
 
 
-def create_vlc_instance():
-    instance = vlc.Instance("--no-video-title-show")
+def create_vlc_instance(*options):
+    instance = vlc.Instance("--no-video-title-show", *options)
     if instance is None:
         detail = vlc.libvlc_errmsg()
         if isinstance(detail, bytes):
@@ -54,13 +54,33 @@ class VlcPlayer(VideoPlayer):
             self._player.set_nsobject(wid)
 
     def open(self, path: str) -> None:
+        self.stop()
         media = self._instance.media_new(Path(path).resolve().as_uri())
+        media.add_option(":start-paused")
         self._player.set_media(media)
-        self._player.play()
-        self._player.set_pause(1)
+        media.release()
+        if self._player.play() == -1:
+            raise RuntimeError("VLC не смог открыть файл")
+
+    def is_ready(self) -> bool:
+        return self._player.get_state() in {vlc.State.Playing, vlc.State.Paused} and self.get_duration_ms() > 0
+
+    def has_error(self) -> bool:
+        return self._player.get_state() == vlc.State.Error
+
+    def video_frames_decoded(self) -> int:
+        media = self._player.get_media()
+        if media is None:
+            return 0
+        try:
+            stats = vlc.MediaStats()
+            return stats.decoded_video if media.get_stats(stats) else 0
+        finally:
+            media.release()
 
     def play(self) -> None:
-        self._player.play()
+        if self._player.play() == -1:
+            raise RuntimeError("Ошибка воспроизведения VLC")
 
     def pause(self) -> None:
         self._player.set_pause(1)
@@ -69,7 +89,17 @@ class VlcPlayer(VideoPlayer):
         self._player.stop()
 
     def seek(self, position_ms: int) -> None:
-        self._player.set_time(max(0, int(position_ms)))
+        position_ms = max(0, int(position_ms))
+        duration = self.get_duration_ms()
+        if duration:
+            position_ms = min(position_ms, max(0, duration - 1))
+        if self._player.set_time(position_ms) == -1:
+            raise RuntimeError("VLC не смог изменить позицию видео")
+
+    def release(self) -> None:
+        self.stop()
+        self._player.release()
+        self._instance.release()
 
     def get_position_ms(self) -> int:
         return max(0, int(self._player.get_time()))

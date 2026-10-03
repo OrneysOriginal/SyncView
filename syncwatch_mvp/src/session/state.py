@@ -1,10 +1,23 @@
 from dataclasses import dataclass
 
+from src.media.metadata import MediaInfo
 from src.session.role import Role
 
 
 @dataclass(slots=True)
+class PeerState:
+    name: str
+    media: MediaInfo | None = None
+    ready: bool = False
+    ping_ms: float = 0.0
+    clock_offset: float = 0.0
+    drift_ms: int = 0
+    last_correction: float = 0.0
+
+
+@dataclass(slots=True)
 class SessionState:
+    session_id: str = ""
     role: Role = Role.NONE
     connected: bool = False
     local_ready: bool = False

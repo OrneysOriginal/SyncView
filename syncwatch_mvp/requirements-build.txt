@@ -1,2 +1,2 @@
--r requirements.txt
-PyInstaller>=6.10,<7
+-r requirements-dev.txt
+PyInstaller==6.22.3

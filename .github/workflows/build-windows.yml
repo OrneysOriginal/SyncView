@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'New version for a draft release (e.g. v0.1.0); leave empty for build only'
+        description: 'Version matching src/version.py (v0.2.0-beta.1); leave empty for build only'
         required: false
         default: ''
         type: string
@@ -22,15 +22,25 @@ jobs:
         with:
           python-version: '3.12'
           architecture: x64
+      - name: Validate release version
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: pwsh
+        run: |
+          $version = python -c "from syncwatch_mvp.src.version import APP_VERSION; print(APP_VERSION)"
+          if ($LASTEXITCODE -ne 0 -or $env:RELEASE_TAG -ne "v$version") {
+              throw "Release tag must match src/version.py: v$version"
+          }
       - name: Download VLC runtime
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $base = "https://download.videolan.org/pub/videolan/vlc/3.0.21/win64"
+          $base = "https://download.videolan.org/pub/videolan/vlc/3.0.23/win64"
           $archive = Join-Path $env:RUNNER_TEMP "vlc.zip"
-          Invoke-WebRequest "$base/vlc-3.0.21-win64.zip" -OutFile $archive
+          Invoke-WebRequest "$base/vlc-3.0.23-win64.zip" -OutFile $archive
           $checksumFile = Join-Path $env:RUNNER_TEMP "vlc.sha256"
-          Invoke-WebRequest "$base/vlc-3.0.21-win64.zip.sha256" -OutFile $checksumFile
+          Invoke-WebRequest "$base/vlc-3.0.23-win64.zip.sha256" -OutFile $checksumFile
           $checksum = Get-Content $checksumFile -Raw
           $expected = [regex]::Match($checksum, '[a-fA-F0-9]{64}').Value
           if (-not $expected -or (Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) {
@@ -40,7 +50,7 @@ jobs:
       - name: Build executable
         shell: pwsh
         run: |
-          ./syncwatch_mvp/build_tools/build_windows.ps1 -VlcDir "$env:RUNNER_TEMP/vlc/vlc-3.0.21"
+          ./syncwatch_mvp/build_tools/build_windows.ps1 -VlcDir "$env:RUNNER_TEMP/vlc/vlc-3.0.23"
       - name: Upload application
         uses: actions/upload-artifact@v4
         with:
@@ -90,9 +100,14 @@ jobs:
 
           Python и VLC включены в пакет. Отдельно устанавливать их для запуска не нужно.
 
-          Сборка проверяет запуск Qt, VLC и сетевого потока. Реальное воспроизведение
-          и синхронизация на двух компьютерах требуют отдельной проверки. Это MVP:
-          известные ограничения сессии и синхронизации описаны в `syncwatch_mvp/AUDIT.md`.
+          Несколько ведомых, синхронные Play/Pause/Seek, выбор получателя файла,
+          проверка полного SHA-256 и экран запуска. На всех устройствах нужна
+          одна версия приложения: сетевой протокол обновлён до версии 2.
+
+          Сборщик выполняет регрессионные тесты и проверяет декодирование AVI,
+          Play/Pause/Seek внутри готового пакета. Просмотр со звуком на нескольких
+          физических компьютерах проверяется отдельно. Результаты и ограничения:
+          `syncwatch_mvp/AUDIT.md`. Версия предназначена для предварительного тестирования.
           NOTES
           # Create a new tag at exactly the commit that was built. Existing tags
           # fail instead of attaching a new binary to a different source version.
@@ -100,6 +115,7 @@ jobs:
             -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$SOURCE_COMMIT"
           gh release create "$RELEASE_TAG" \
             --repo "$GH_REPO" --verify-tag --draft \
+            --prerelease \
             --title "SyncWatch $RELEASE_TAG — Windows x64" \
             --notes-file release-notes.md \
             "release-assets/SyncWatch-Windows-x64.zip"

@@ -1,7 +1,7 @@
-from enum import StrEnum
+from enum import Enum
 
 
-class Role(StrEnum):
+class Role(str, Enum):
     NONE = "none"
     HOST = "host"
     CLIENT = "client"
