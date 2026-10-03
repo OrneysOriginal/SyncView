@@ -7,7 +7,7 @@ import pytest
 from src.media.fingerprint import calculate_fingerprint
 from src.media.metadata import MediaInfo
 from src.network.file_transfer import FileTransferReceiver, FileTransferSender, safe_filename
-from src.network.messages import Message
+from src.network.messages import PROTOCOL_VERSION, Message
 from src.network.protocol import decode_message, encode_message
 
 
@@ -73,7 +73,7 @@ def test_windows_filename_is_safe_and_bounded(name):
 def test_reserved_payload_cannot_override_envelope():
     original = Message("ping", {"type": "play", "session_id": "wrong", "protocol_version": 1}, session_id="room")
     decoded = decode_message(encode_message(original))
-    assert decoded.type == "ping" and decoded.session_id == "room" and decoded.protocol_version == 2
+    assert decoded.type == "ping" and decoded.session_id == "room" and decoded.protocol_version == PROTOCOL_VERSION
 
 
 @pytest.mark.parametrize("field,value", [("sent_at", float("nan")), ("sent_at", float("inf")),
@@ -101,3 +101,19 @@ def test_invalid_payload_is_rejected(kind, payload):
 def test_incomplete_messages_cannot_reach_ui(kind, payload):
     with pytest.raises(ValueError):
         decode_message(encode_message(Message(kind, payload)))
+
+
+@pytest.mark.parametrize("kind,payload", [
+    ("seek_ack", {"seek_id": 1, "media_fingerprint": "x", "position_ms": 5000, "paused": "true"}),
+    ("seek_ack", {"seek_id": 1, "media_fingerprint": "x", "paused": True}),
+    ("seek_complete", {"seek_id": 0, "media_fingerprint": "x"}),
+    ("seek_failed", {"seek_id": 1, "media_fingerprint": "x"}),
+])
+def test_invalid_seek_confirmation_is_rejected(kind, payload):
+    with pytest.raises(ValueError):
+        decode_message(encode_message(Message(kind, payload)))
+
+
+def test_previous_protocol_cannot_join_confirmation_session():
+    with pytest.raises(ValueError, match="Несовместимая"):
+        decode_message(encode_message(Message("join", {"room_code": "123456"}, protocol_version=2)))

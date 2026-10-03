@@ -12,13 +12,15 @@ ALLOWED_TYPES = {
     "media_info", "media_match", "media_mismatch", "media_force_match",
     "ready", "not_ready",
     "play", "pause", "seek", "stop", "state", "sync_correction",
+    "seek_ack", "seek_complete", "seek_failed",
     "session_started", "session_ended", "client_reconnected",
     "file_offer", "file_accept", "file_reject", "file_cancel",
     "file_chunk", "file_complete", "file_error",
     "file_received",
 }
 
-HOST_COMMANDS = {"play", "pause", "seek", "stop", "sync_correction", "media_force_match", "session_ended"}
+HOST_COMMANDS = {"play", "pause", "seek", "stop", "sync_correction", "media_force_match", "session_ended",
+                 "file_offer", "seek_complete"}
 
 
 def validate_payload(kind: str, data: dict) -> None:
@@ -62,10 +64,20 @@ def validate_payload(kind: str, data: dict) -> None:
             raise ValueError("Некорректное время команды")
         if "resume" in data:
             boolean("resume")
+        if "seek_feedback_ms" in data:
+            integer("seek_feedback_ms", -10**12, 10**12)
     if kind == "state":
         integer("position_ms")
         boolean("playing")
         integer("last_command_id")
+    if kind in {"seek_ack", "seek_complete", "seek_failed"}:
+        integer("seek_id", 1)
+        string("media_fingerprint", 128)
+    if kind == "seek_ack":
+        integer("position_ms")
+        boolean("paused")
+    if kind == "seek_failed":
+        string("reason")
     if kind.startswith("file_"):
         string("transfer_id", 128)
     if kind == "file_chunk":

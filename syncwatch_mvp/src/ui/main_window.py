@@ -6,7 +6,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QPainter, QPolygonF
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -22,6 +23,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStackedWidget,
+    QStyle,
+    QStyleOptionSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -34,10 +37,13 @@ from src.network.messages import Message
 from src.network.network_thread import NetworkThread
 from src.player.vlc_player import VlcPlayer
 from src.session.role import Role
-from src.session.state import PeerState, SessionState
+from src.session.state import PeerState, SeekState, SessionState
 from src.synchronization.drift_calculator import calculate_drift_ms, needs_correction
 from src.ui.theme import APP_STYLE
 from src.version import APP_VERSION
+
+SEEK_POSITION_TOLERANCE_MS = 150
+SEEK_CONFIRMATION_TIMEOUT_MS = 10000
 
 
 class VideoSurface(QWidget):
@@ -79,6 +85,113 @@ class WorkerSignals(QObject):
     failed = Signal(object)
 
 
+class SeekSlider(QSlider):
+    """Seek on both groove clicks and handle drags, using the styled handle span."""
+
+    def _set_pointer_value(self, event) -> None:
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        handle = self.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                             QStyle.SubControl.SC_SliderHandle, self)
+        span = max(1, self.width() - handle.width())
+        position = round(event.position().x() - handle.width() / 2)
+        self.setValue(QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                                     position, span, option.upsideDown))
+
+    def mousePressEvent(self, event) -> None:
+        if self.isEnabled() and event.button() == Qt.MouseButton.LeftButton:
+            self.setSliderDown(True)
+            self._set_pointer_value(event)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.isSliderDown():
+            self._set_pointer_value(event)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self.isSliderDown() and event.button() == Qt.MouseButton.LeftButton:
+            self._set_pointer_value(event)
+            self.setSliderDown(False)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        # A wheel must not move only the thumb without issuing a seek command.
+        event.ignore()
+
+
+class SeekFeedback(QWidget):
+    """Transient, non-interactive overlay above VLC's native video window."""
+
+    def __init__(self, parent: QWidget, surface: QWidget) -> None:
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowTransparentForInput | Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFixedSize(150, 130)
+        self.surface = surface
+        self.amount_ms = 0
+        self.progress = 0.0
+        self.animation = QVariantAnimation(self)
+        self.animation.setDuration(850)
+        self.animation.setStartValue(0.0)
+        self.animation.setEndValue(1.0)
+        self.animation.valueChanged.connect(self._animate)
+        self.animation.finished.connect(self.hide)
+
+    def _animate(self, value) -> None:
+        self.progress = float(value)
+        self.update()
+
+    def reposition(self) -> None:
+        fraction = 0.25 if self.amount_ms < 0 else 0.75
+        center = self.surface.mapToGlobal(QPoint(round(self.surface.width() * fraction),
+                                                 self.surface.height() // 2))
+        self.move(center - QPoint(self.width() // 2, self.height() // 2))
+
+    def flash(self, amount_ms: int) -> None:
+        self.amount_ms = amount_ms
+        self.animation.stop()
+        self.progress = 0.0
+        self.reposition()
+        if self.parentWidget().isVisible():
+            self.show()
+            self.raise_()
+        self.animation.start()
+
+    def clear(self) -> None:
+        self.animation.stop()
+        self.hide()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setOpacity(min(1.0, (1.0 - self.progress) * 3))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 165))
+        painter.drawEllipse(15, 5, 120, 120)
+        painter.setBrush(QColor("white"))
+        direction = -1 if self.amount_ms < 0 else 1
+        for x in (55, 75, 95):
+            painter.drawPolygon(QPolygonF([QPointF(x - direction * 7, 34),
+                                            QPointF(x + direction * 7, 46),
+                                            QPointF(x - direction * 7, 58)]))
+        painter.setPen(QColor("white"))
+        font = painter.font()
+        font.setPointSize(15)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(0, 70, 150, 35, Qt.AlignmentFlag.AlignCenter,
+                         f"{'−' if direction < 0 else '+'}{abs(self.amount_ms) // 1000} сек")
+
+
 class TransferSignals(QObject):
     progress = Signal(str, float, str)
     finished = Signal(str)
@@ -99,6 +212,16 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._command_timers: list[QTimer] = []
         self._pending_command_id = 0
+        self._pending_command: tuple[Message, float] | None = None
+        self._seek: SeekState | None = None
+        self.seek_poll = QTimer(self)
+        self.seek_poll.setInterval(25)
+        self.seek_poll.timeout.connect(self._poll_seek_position)
+        self.seek_timeout = QTimer(self)
+        self.seek_timeout.setSingleShot(True)
+        self.seek_timeout.timeout.connect(self._seek_timed_out)
+        self._seek_feedback_time = 0.0
+        self._seek_feedback_total = 0
         self._clock_offset = 0.0
         self._clock_synced = False
         self._transfer_peer: str | None = None
@@ -369,6 +492,14 @@ class MainWindow(QMainWindow):
         self.player = VlcPlayer(self.video_surface, instance=vlc_instance)
         video_layout.addWidget(self.video_surface, 1)
 
+        self.seek_status_banner = QLabel()
+        self.seek_status_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.seek_status_banner.setTextFormat(Qt.TextFormat.PlainText)
+        self.seek_status_banner.setWordWrap(True)
+        self.seek_status_banner.setStyleSheet("background:#0D0F13; color:#FFFFFF; padding:6px;")
+        self.seek_status_banner.hide()
+        video_layout.addWidget(self.seek_status_banner)
+
         self.player_controls = QFrame()
         self.player_controls.setObjectName("playerControls")
         controls = QHBoxLayout(self.player_controls)
@@ -383,7 +514,7 @@ class MainWindow(QMainWindow):
 
         self.time_label = QLabel("00:00")
         self.time_label.setObjectName("playerTime")
-        self.timeline = QSlider(Qt.Orientation.Horizontal)
+        self.timeline = SeekSlider(Qt.Orientation.Horizontal)
         self.timeline.setRange(0, 1000)
         self.timeline.sliderPressed.connect(self._timeline_pressed)
         self.timeline.sliderReleased.connect(self._timeline_released)
@@ -408,6 +539,14 @@ class MainWindow(QMainWindow):
         self.fullscreen_button.clicked.connect(self._toggle_fullscreen)
 
         controls.addWidget(self.play_pause_button)
+        self.seek_back_button = QPushButton("◀◀ 5")
+        self.seek_forward_button = QPushButton("5 ▶▶")
+        for button, delta in ((self.seek_back_button, -5000), (self.seek_forward_button, 5000)):
+            button.setObjectName("playerIconButton")
+            button.setFixedSize(62, 36)
+            button.setToolTip("Назад на 5 секунд (← / J)" if delta < 0 else "Вперёд на 5 секунд (→ / L)")
+            button.clicked.connect(lambda checked=False, step=delta: self._seek_relative(step))
+            controls.addWidget(button)
         controls.addWidget(self.time_label)
         controls.addWidget(self.timeline, 1)
         controls.addWidget(self.duration_label)
@@ -417,6 +556,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.fullscreen_button)
         video_layout.addWidget(self.player_controls)
         layout.addWidget(self.video_card, 1)
+        self.seek_feedback = SeekFeedback(self, self.video_surface)
 
         # Отслеживаем активность мыши над всей областью проигрывателя.
         # Панель управления появляется сразу и скрывается после бездействия.
@@ -439,8 +579,8 @@ class MainWindow(QMainWindow):
         self.ping_label.setObjectName("muted")
         self.drift_label = QLabel("Рассинхрон: —")
         self.drift_label.setObjectName("muted")
-        choose = QPushButton("Сменить файл")
-        choose.clicked.connect(self._choose_media)
+        self.choose_media_button = QPushButton("Сменить файл")
+        self.choose_media_button.clicked.connect(self._choose_media)
         self.send_file_button = QPushButton("Отправить файл")
         self.send_file_button.setToolTip("Отправить выбранный видеофайл на другое устройство по локальной сети")
         self.send_file_button.clicked.connect(self._start_file_offer)
@@ -467,7 +607,7 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.recipient_combo)
         actions.addWidget(self.send_file_button)
         actions.addWidget(self.cancel_transfer_button)
-        actions.addWidget(choose)
+        actions.addWidget(self.choose_media_button)
         info_layout.addLayout(info)
         self.participants_label = QLabel()
         self.participants_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -487,6 +627,7 @@ class MainWindow(QMainWindow):
 
         self.player_page = self._shell("player", content)
         self.stack.addWidget(self.player_page)
+        self._install_seek_key_filters()
 
     def _install_player_activity_filter(self, widget: QWidget) -> None:
         widget.setMouseTracking(True)
@@ -496,6 +637,18 @@ class MainWindow(QMainWindow):
             child.installEventFilter(self)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if (hasattr(self, "player_page") and self.stack.currentWidget() == self.player_page
+                and isinstance(watched, QWidget) and self.player_page.isAncestorOf(watched)):
+            steps = {Qt.Key.Key_Left: -5000, Qt.Key.Key_J: -5000,
+                     Qt.Key.Key_Right: 5000, Qt.Key.Key_L: 5000}
+            if event.type() in {QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress} and event.key() in steps:
+                if event.type() == QEvent.Type.KeyPress:
+                    self._seek_relative(steps[event.key()])
+                event.accept()
+                return True
+        if (hasattr(self, "seek_feedback") and self.seek_feedback.isVisible()
+                and watched is self.video_surface and event.type() in {QEvent.Type.Resize, QEvent.Type.Move}):
+            self.seek_feedback.reposition()
         if hasattr(self, "video_card") and (watched is self.video_card or self.video_card.isAncestorOf(watched)):
             if event.type() in {
                 QEvent.Type.MouseMove,
@@ -551,6 +704,8 @@ class MainWindow(QMainWindow):
         self.network.connect_to(ip, self.port_edit.value(), code, name)
 
     def _choose_media(self) -> None:
+        if self.state.role != Role.HOST:
+            return
         if self.transfer_active:
             self._show_error("Дождитесь окончания передачи файла")
             return
@@ -566,8 +721,16 @@ class MainWindow(QMainWindow):
             timer.deleteLater()
         self._command_timers.clear()
         self._pending_command_id = 0
+        self._pending_command = None
+        self._clear_seek()
+        self._seek_feedback_total = 0
+        self.seek_feedback.clear()
 
-    def _start_media_load(self, path: str | Path) -> None:
+    def _start_media_load(self, path: str | Path, *, from_host: bool = False) -> None:
+        if self.state.role != Role.HOST and not (
+            self.state.role == Role.CLIENT and from_host and self.state.connected and self.remote_media
+        ):
+            return
         self._invalidate_commands()
         self._load_generation += 1
         generation = self._load_generation
@@ -621,6 +784,12 @@ class MainWindow(QMainWindow):
         generation, media, deadline = result
         if generation != self._load_generation or self._closing:
             return
+        if self.state.role == Role.CLIENT and (
+            not self.remote_media or media.file_size != self.remote_media.file_size
+            or media.fingerprint != self.remote_media.fingerprint
+        ):
+            self._media_failed((generation, "Полученный файл не совпадает с выбранным видео ведущего"))
+            return
         if self.player.has_error():
             self._media_failed((generation, "VLC не поддерживает этот файл или файл повреждён"))
             return
@@ -660,7 +829,7 @@ class MainWindow(QMainWindow):
 
     def _check_media_match(self) -> None:
         self.participants_label.setText(" • ".join(f"{peer.name}: " +
-            ("готов" if peer.ready else "выбирает видео") for peer in self.peers.values()))
+            ("готов" if peer.ready else "ожидает видео") for peer in self.peers.values()))
         self.state.remote_ready = bool(self.peers) and all(peer.ready for peer in self.peers.values())
         media_present = bool(self.local_media and self.peers and all(peer.media for peer in self.peers.values()))
         exact = media_present and all(media_matches(self.local_media, peer.media) for peer in self.peers.values())
@@ -677,7 +846,9 @@ class MainWindow(QMainWindow):
         elif self.state.local_ready:
             self.player_status.setText("Видео готово. Ожидание подключения и готовности участников…")
         else:
-            self.player_status.setText("Выберите видеофайл и дождитесь готовности участников.")
+            self.player_status.setText("Ожидание файла от ведущего. Подтвердите получение, когда появится предложение."
+                                       if self.state.role == Role.CLIENT else
+                                       "Выберите видеофайл и передайте его участникам.")
         self._update_transfer_controls()
 
     def _force_media_match(self) -> None:
@@ -714,10 +885,13 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 self.recipient_combo.setCurrentIndex(index)
         self.recipient_combo.setVisible(self.state.role == Role.HOST and bool(entries))
+        self.choose_media_button.setVisible(self.state.role == Role.HOST)
+        self.choose_media_button.setEnabled(not self.transfer_active)
         self.recipient_combo.setEnabled(not self.transfer_active)
         self.cancel_transfer_button.setVisible(self.transfer_active)
         self.transfer_progress.setVisible(self.transfer_active)
-        self.send_file_button.setVisible(bool(self.local_media and self.local_media_path and self._is_connected()
+        self.send_file_button.setVisible(bool(self.state.role == Role.HOST and self.local_media
+                                              and self.local_media_path and self._is_connected()
                                               and not self.transfer_active))
 
     def _set_transfer_progress(self, fraction: float, text: str) -> None:
@@ -725,21 +899,20 @@ class MainWindow(QMainWindow):
         self.player_status.setText(text)
 
     def _start_file_offer(self) -> None:
-        if self.transfer_active or not self.local_media or not self.local_media_path or not self._is_connected():
+        if (self.state.role != Role.HOST or self.transfer_active or not self.local_media
+                or not self.local_media_path or not self._is_connected()):
             return
-        self._transfer_peer = self.recipient_combo.currentData() if self.state.role == Role.HOST else "host"
+        self._transfer_peer = self.recipient_combo.currentData()
         if self._transfer_peer not in self.peers:
             self._show_error("Выберите подключённого получателя")
             return
-        if self.player.is_playing():
-            if self.state.role == Role.HOST:
-                self._host_pause()
-            else:
-                self.player.pause()
+        if self._seek:
+            self._broadcast_command("pause", self._seek.position_ms)
+        elif self.player.is_playing():
+            self._host_pause()
         peer_id = self._transfer_peer
-        is_host = self.state.role == Role.HOST
         def send(kind, payload):
-            self.network.send_wait(kind, payload, recipient_id=peer_id if is_host else None)
+            self.network.send_wait(kind, payload, recipient_id=peer_id)
         self._transfer_sender = FileTransferSender(self.local_media_path, self.local_media, send=send)
         self.transfer_active = True
         self._transfer_running = False
@@ -818,6 +991,12 @@ class MainWindow(QMainWindow):
     def _handle_file_offer(self, payload: dict, peer_id: str) -> None:
         transfer_id = payload["transfer_id"]
         target = peer_id if self.state.role == Role.HOST else None
+        if (self.state.role != Role.CLIENT or peer_id != "host" or not self.remote_media
+                or payload["fingerprint"] != self.remote_media.fingerprint
+                or payload["file_size"] != self.remote_media.file_size):
+            self.network.send("file_reject", {"transfer_id": transfer_id,
+                              "reason": "Можно получить только выбранное видео ведущего"}, recipient_id=target)
+            return
         if self.transfer_active or self._incoming_offer_id:
             self.network.send("file_reject", {"transfer_id": transfer_id, "reason": "Уже идёт другая передача"}, recipient_id=target)
             return
@@ -845,8 +1024,6 @@ class MainWindow(QMainWindow):
             self._show_error(str(exc))
             return
         self.player.pause()
-        if self.state.role == Role.HOST:
-            self._host_pause()
         self._transfer_receiver = receiver
         self.transfer_active = True
         self.transfer_timeout.start()
@@ -885,6 +1062,8 @@ class MainWindow(QMainWindow):
             self.peers[peer_id] = PeerState(p['device_name'])
             self.state.connected = True
             self.state.media_force_match = False
+            if self._seek:
+                self._broadcast_command("pause", self._seek.position_ms)
             if self.player.is_playing():
                 self._host_pause()
             self._announce_media(recipient_id=peer_id)
@@ -913,6 +1092,17 @@ class MainWindow(QMainWindow):
             self.state.media_force_match = False
             self._invalidate_commands()
             self.player.pause()
+            if self.state.role == Role.CLIENT and (
+                not self.local_media or not media_matches(self.local_media, peer.media)
+            ):
+                if self.transfer_active or self._incoming_offer_id:
+                    self._cleanup_transfer_state(send_cancel=True)
+                self._load_generation += 1
+                self.player.stop()
+                self.local_media = None
+                self.local_media_path = None
+                self.state.local_ready = False
+                self._announce_media()
             self._check_media_match()
         elif message.type in {"ready", "not_ready"}:
             peer.ready = p['media_loaded'] and peer.media is not None
@@ -928,6 +1118,14 @@ class MainWindow(QMainWindow):
         elif message.type in {"play", "pause", "seek", "sync_correction"}:
             if self.state.role == Role.CLIENT:
                 self._schedule_remote_command(message)
+        elif message.type == "seek_ack" and self.state.role == Role.HOST:
+            self._handle_seek_ack(message)
+        elif message.type == "seek_complete" and self.state.role == Role.CLIENT:
+            if self._seek_message_matches(p) and self._seek.local_ready and not self._seek.failed:
+                self._clear_seek()
+                self._check_media_match()
+        elif message.type == "seek_failed" and self._seek_message_matches(p):
+            self._fail_seek(p["reason"], notify=self.state.role == Role.HOST)
         elif message.type == "state" and self.state.role == Role.HOST:
             self._handle_remote_state(message)
         elif message.type == "pong":
@@ -958,7 +1156,7 @@ class MainWindow(QMainWindow):
                 self._send_transfer("file_received", {"transfer_id": token})
                 path = p['path']
                 self._cleanup_transfer_state(send_cancel=False)
-                self._start_media_load(path)
+                self._start_media_load(path, from_host=True)
             elif message.type == "file_received" and sender:
                 self._cleanup_transfer_state(send_cancel=False)
                 self.player_status.setText("Получатель подтвердил SHA-256. Ожидание готовности видео…")
@@ -976,15 +1174,166 @@ class MainWindow(QMainWindow):
             return
         self._queue_command(message, remote=True)
 
+    def _clear_seek(self) -> None:
+        self.seek_poll.stop()
+        self.seek_timeout.stop()
+        if self._seek and self._pending_command_id == self._seek.command_id:
+            self._pending_command_id = 0
+        self._seek = None
+        self.seek_status_banner.hide()
+
+    def _prepare_seek(self, message: Message) -> None:
+        p = message.payload
+        self._pending_command = None
+        self._pending_command_id = p["command_id"]
+        self._seek = SeekState(p["command_id"], p["position_ms"], p["media_fingerprint"],
+                               bool(p.get("resume", False)),
+                               set(self.peers) if self.state.role == Role.HOST else set())
+        self.controls_hide_timer.stop()
+        self._show_player_controls(restart_timer=False)
+        try:
+            self.player.pause()
+            self.player.seek(p["position_ms"])
+        except Exception as exc:
+            self._fail_seek(str(exc))
+            return
+        if self.state.role == Role.CLIENT and p.get("seek_feedback_ms"):
+            self.seek_feedback.flash(p["seek_feedback_ms"])
+        self.seek_timeout.start(SEEK_CONFIRMATION_TIMEOUT_MS + (2000 if self.state.role == Role.CLIENT else 0))
+        self.seek_poll.start()
+        self._show_seek_status()
+
+    def _poll_seek_position(self) -> None:
+        operation = self._seek
+        if not operation or operation.failed or self._closing:
+            return
+        try:
+            if self.player.has_error():
+                self._fail_seek("VLC не смог выполнить перемотку")
+                return
+            position = self.player.get_position_ms()
+            settled = (not self.player.is_playing() and self.player.is_ready()
+                       and abs(position - operation.position_ms) <= SEEK_POSITION_TOLERANCE_MS)
+        except Exception as exc:
+            self._fail_seek(str(exc))
+            return
+        operation.stable_samples = operation.stable_samples + 1 if settled else 0
+        if operation.stable_samples < 2:
+            return
+        operation.local_ready = True
+        self.seek_poll.stop()
+        if self.state.role == Role.HOST:
+            self._finish_seek_if_ready()
+        else:
+            self.network.send("seek_ack", {"seek_id": operation.command_id,
+                "media_fingerprint": operation.media_fingerprint, "position_ms": position, "paused": True})
+        self._show_seek_status()
+
+    def _seek_message_matches(self, payload: dict) -> bool:
+        return bool(self._seek and payload.get("seek_id") == self._seek.command_id
+                    and payload.get("media_fingerprint") == self._seek.media_fingerprint)
+
+    def _handle_seek_ack(self, message: Message) -> None:
+        p = message.payload
+        if not self._seek_message_matches(p) or self._seek.failed:
+            return
+        operation = self._seek
+        if (message.sender_id not in operation.waiting or p.get("paused") is not True
+                or abs(p["position_ms"] - operation.position_ms) > SEEK_POSITION_TOLERANCE_MS):
+            return
+        operation.waiting.remove(message.sender_id)
+        self._finish_seek_if_ready()
+        self._show_seek_status()
+
+    def _finish_seek_if_ready(self) -> None:
+        operation = self._seek
+        if (self.state.role != Role.HOST or not operation or operation.failed
+                or not operation.local_ready or operation.waiting or not self._playback_allowed()):
+            return
+        # The slowest peer may have taken time to answer: recheck our position.
+        if self.player.has_error():
+            self._fail_seek("Ошибка плеера ведущего при синхронизации")
+            return
+        if (self.player.is_playing() or not self.player.is_ready()
+                or abs(self.player.get_position_ms() - operation.position_ms) > SEEK_POSITION_TOLERANCE_MS):
+            operation.local_ready = False
+            operation.stable_samples = 0
+            self.seek_poll.start()
+            return
+        self.network.send("seek_complete", {"seek_id": operation.command_id,
+                          "media_fingerprint": operation.media_fingerprint})
+        position, resume = operation.position_ms, operation.resume
+        self._clear_seek()
+        self._check_media_match()
+        if resume:
+            # All positions are fixed while paused; only now schedule the common start.
+            self._broadcast_command("play", position, True)
+
+    def _show_seek_status(self) -> None:
+        if not self._seek or self._seek.failed:
+            return
+        if self.state.role == Role.HOST:
+            total = len(self.peers) + 1
+            ready = len(self.peers) - len(self._seek.waiting) + int(self._seek.local_ready)
+            self.player_status.setText(f"Синхронизация после перемотки: готово {ready} из {total} устройств…")
+        else:
+            self.player_status.setText("Ожидание готовности всех устройств…" if self._seek.local_ready
+                                       else "Перемотка и подготовка видео…")
+        self.seek_status_banner.setText(self.player_status.text())
+        self.seek_status_banner.show()
+
+    def _seek_timed_out(self) -> None:
+        if not self._seek:
+            return
+        missing = [self.peers[peer].name for peer in self._seek.waiting if peer in self.peers]
+        if not self._seek.local_ready:
+            missing.insert(0, "это устройство")
+        reason = ("Нет подтверждения перемотки за 10 секунд" if self.state.role == Role.HOST else
+                  "Время ожидания завершения синхронизации истекло")
+        if missing:
+            reason += ": " + ", ".join(missing)
+        self._fail_seek(reason)
+
+    def _fail_seek(self, reason: str, *, notify: bool = True) -> None:
+        operation = self._seek
+        if not operation or operation.failed:
+            return
+        operation.failed = True
+        self.seek_poll.stop()
+        self.seek_timeout.stop()
+        self._pending_command_id = 0
+        try:
+            self.player.pause()
+        except Exception:
+            logging.exception("Unable to pause after failed seek")
+        reason = (reason or "Не удалось подтвердить перемотку")[:1024]
+        if notify and self.state.connected:
+            self.network.send("seek_failed", {"seek_id": operation.command_id,
+                              "media_fingerprint": operation.media_fingerprint, "reason": reason})
+        self.player_status.setText(f"{reason}. Просмотр остаётся на паузе." +
+                                  (" Нажмите Play, чтобы повторить синхронизацию." if self.state.role == Role.HOST else ""))
+        self.seek_status_banner.setText(self.player_status.text())
+        self.seek_status_banner.show()
+
     def _queue_command(self, message: Message, *, remote: bool = False) -> None:
         command_id = message.payload["command_id"]
         if command_id <= self.last_command_id:
+            return
+        if message.type == "seek" and not self._playback_allowed():
+            return
+        if message.type in {"play", "sync_correction"} and self._seek and (
+            not self._seek.local_ready or self._seek.failed
+        ):
             return
         self.last_command_id = command_id
         for timer in self._command_timers:
             timer.stop()
             timer.deleteLater()
         self._command_timers.clear()
+        self._clear_seek()
+        if message.type == "seek":
+            self._prepare_seek(message)
+            return
         now = time.monotonic()
         if remote and self._clock_synced:
             deadline = float(message.payload["execute_at"]) - self._clock_offset
@@ -997,6 +1346,7 @@ class MainWindow(QMainWindow):
         timer.setSingleShot(True)
         epoch = self._generation
         self._pending_command_id = command_id
+        self._pending_command = (message, deadline)
 
         def execute():
             if timer in self._command_timers:
@@ -1005,6 +1355,7 @@ class MainWindow(QMainWindow):
             if self._closing or epoch != self._generation or command_id != self.last_command_id:
                 return
             self._pending_command_id = 0
+            self._pending_command = None
             if message.type != "pause" and not self._playback_allowed():
                 return
             try:
@@ -1021,30 +1372,54 @@ class MainWindow(QMainWindow):
         resume = message.type == "play" or bool(message.payload.get("resume", False))
         if resume:
             position += lateness
+        position = max(0, min(max(0, self.player.get_duration_ms() - 1), position))
         if message.type == "pause":
             self.player.pause()
             self.player.seek(position)
             self.controls_hide_timer.stop()
             self._show_player_controls(restart_timer=False)
         else:
-            self.player.seek(position)
+            if message.type != "play" or abs(self.player.get_position_ms() - position) > SEEK_POSITION_TOLERANCE_MS:
+                self.player.seek(position)
             if resume:
                 self.player.play()
             else:
                 self.player.pause()
             self._show_player_controls()
+        if message.type == "seek" and message.payload.get("seek_feedback_ms") and self.state.role == Role.CLIENT:
+            self.seek_feedback.flash(message.payload["seek_feedback_ms"])
 
-    def _broadcast_command(self, kind: str, position: int, resume: bool = False) -> None:
+    def _broadcast_command(self, kind: str, position: int, resume: bool = False, *,
+                           project_position: bool = False, seek_feedback_ms: int = 0) -> None:
+        if self.state.role != Role.HOST:
+            return
         delay_ms = max(350, min(1500, int(self.state.ping_ms * 3)))
+        if kind == "seek":
+            delay_ms = 0
+        elif project_position and resume:
+            position += delay_ms
+        position = max(0, min(max(0, self.player.get_duration_ms() - 1), position))
         command = {
             "command_id": self._next_command(), "position_ms": max(0, position),
             "resume": resume, "execute_delay_ms": delay_ms,
             "execute_at": time.monotonic() + delay_ms / 1000,
             "media_fingerprint": self.local_media.fingerprint if self.local_media else "",
         }
+        if kind == "seek" and seek_feedback_ms:
+            command["seek_feedback_ms"] = seek_feedback_ms
         self._last_broadcast_id = command["command_id"]
-        self.network.send(kind, command)
-        self._queue_command(Message(kind, command))
+        if kind == "seek":
+            # Pause locally before the command can reach another device.
+            try:
+                self.player.pause()
+            except Exception as exc:
+                self._show_error(str(exc))
+                return
+            self.network.send(kind, command)
+            self._queue_command(Message(kind, command))
+        else:
+            self.network.send(kind, command)
+            self._queue_command(Message(kind, command))
 
     def _next_command(self) -> int:
         self.command_id += 1
@@ -1054,7 +1429,8 @@ class MainWindow(QMainWindow):
         self._show_player_controls(restart_timer=False)
         if self.state.role != Role.HOST:
             return
-        if self.player.is_playing():
+        _, playing = self._logical_playback()
+        if playing:
             self._host_pause()
             return
         if not self._playback_allowed():
@@ -1127,23 +1503,56 @@ class MainWindow(QMainWindow):
 
     def _host_play(self) -> None:
         if self.state.role == Role.HOST and self._playback_allowed():
-            self._broadcast_command("play", self.player.get_position_ms(), True)
+            if self._seek:
+                if self._seek.failed:
+                    self._broadcast_command("seek", self._seek.position_ms, True)
+                else:
+                    self._seek.resume = True
+                    self._finish_seek_if_ready()
+                return
+            position, playing = self._logical_playback()
+            self._broadcast_command("play", position, True, project_position=playing)
+
+    def _logical_playback(self) -> tuple[int, bool]:
+        """Position now, including an accepted command awaiting its common deadline."""
+        if self._seek:
+            return self._seek.position_ms, self._seek.resume and not self._seek.failed
+        if self._pending_command:
+            message, deadline = self._pending_command
+            playing = message.type == "play" or bool(message.payload.get("resume", False))
+            position = message.payload["position_ms"]
+            if playing and self.player.is_playing():
+                position += round((time.monotonic() - deadline) * 1000)
+            return position, playing
+        return self.player.get_position_ms(), self.player.is_playing()
 
     def _host_pause(self) -> None:
         if self.state.role != Role.HOST or not self.local_media:
             return
+        if self._seek:
+            self._seek.resume = False
+            self._finish_seek_if_ready()
+            return
+        position, playing = self._logical_playback()
         delay_ms = max(350, min(1500, int(self.state.ping_ms * 3)))
-        position = self.player.get_position_ms() + (delay_ms if self.player.is_playing() else 0)
-        self._broadcast_command("pause", position)
+        self._broadcast_command("pause", position + (delay_ms if playing else 0))
 
     def _seek_relative(self, delta_ms: int) -> None:
         if self.state.role != Role.HOST or not self._playback_allowed():
             return
-        duration = self.player.get_duration_ms()
-        target = max(0, min(max(0, duration - 1), self.player.get_position_ms() + delta_ms))
-        self._broadcast_command("seek", target, self.player.is_playing())
+        position, playing = self._logical_playback()
+        now = time.monotonic()
+        if now - self._seek_feedback_time > 0.85 or self._seek_feedback_total * delta_ms <= 0:
+            self._seek_feedback_total = 0
+        self._seek_feedback_time = now
+        self._seek_feedback_total += delta_ms
+        self._broadcast_command("seek", position + delta_ms, playing,
+                                project_position=True, seek_feedback_ms=self._seek_feedback_total)
+        self.seek_feedback.flash(self._seek_feedback_total)
 
     def _timeline_pressed(self) -> None:
+        if self.state.role != Role.HOST or not self._playback_allowed():
+            return
         self.dragging = True
         self.controls_hide_timer.stop()
         self._show_player_controls(restart_timer=False)
@@ -1154,7 +1563,10 @@ class MainWindow(QMainWindow):
         if self.state.role == Role.HOST and self._playback_allowed():
             duration = self.player.get_duration_ms()
             target = int(max(0, duration - 1) * self.timeline.value() / 1000)
-            self._broadcast_command("seek", target, self.player.is_playing())
+            _, playing = self._logical_playback()
+            self._seek_feedback_total = 0
+            self.seek_feedback.clear()
+            self._broadcast_command("seek", target, playing)
 
     def _send_state(self) -> None:
         if not self.state.connected:
@@ -1168,7 +1580,7 @@ class MainWindow(QMainWindow):
 
     def _handle_remote_state(self, message: Message) -> None:
         peer = self.peers.get(message.sender_id)
-        if not peer or not peer.ready or not self._playback_allowed() or self._pending_command_id:
+        if not peer or not peer.ready or not self._playback_allowed() or self._pending_command_id or self._seek:
             return
         if message.payload.get("last_command_id", 0) < self._last_broadcast_id:
             return
@@ -1199,12 +1611,15 @@ class MainWindow(QMainWindow):
             self.timeline.setValue(int(position * 1000 / duration))
         self.time_label.setText(self._fmt(position))
         self.duration_label.setText(self._fmt(duration))
-        self.play_pause_button.setText("Ⅱ" if self.player.is_playing() else "▶")
+        _, requested_playing = self._logical_playback()
+        self.play_pause_button.setText("Ⅱ" if requested_playing else "▶")
         host_controls = self.state.role == Role.HOST and (
             self.player.is_playing() or self._playback_allowed()
         )
         self.play_pause_button.setEnabled(host_controls)
         self.timeline.setEnabled(self.state.role == Role.HOST and self._playback_allowed())
+        for button in (self.seek_back_button, self.seek_forward_button):
+            button.setEnabled(self.state.role == Role.HOST and self._playback_allowed())
         role = "Ведущий" if self.state.role == Role.HOST else "Ведомый"
         self.role_label.setText(f"Роль: {role}")
         self.ping_label.setText(f"Ping: {self.state.ping_ms:.0f} мс")
@@ -1288,15 +1703,32 @@ class MainWindow(QMainWindow):
                 event.accept()
                 return
             if key == Qt.Key.Key_J:
-                self._seek_relative(-10_000)
+                self._seek_relative(-5_000)
                 event.accept()
                 return
             if key == Qt.Key.Key_L:
-                self._seek_relative(10_000)
+                self._seek_relative(5_000)
                 event.accept()
                 return
 
         super().keyPressEvent(event)
+
+    def _install_seek_key_filters(self) -> None:
+        # Includes focused controls outside the video card (recipient, file buttons).
+        if not getattr(self, "_seek_keys_installed", False):
+            for widget in self.player_page.findChildren(QWidget):
+                widget.installEventFilter(self)
+            self._seek_keys_installed = True
+
+    def moveEvent(self, event) -> None:  # type: ignore[override]
+        super().moveEvent(event)
+        if hasattr(self, "seek_feedback") and self.seek_feedback.isVisible():
+            self.seek_feedback.reposition()
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        if hasattr(self, "seek_feedback"):
+            self.seek_feedback.clear()
+        super().hideEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._closing = True

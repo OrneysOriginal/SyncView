@@ -28,20 +28,64 @@ def connected_windows(window_factory, qt_app, tmp_path, count=2):
     return host, clients, movie
 
 
-def test_three_windows_handshake_media_play_seek_pause_and_exit(window_factory, qt_app, tmp_path):
+def test_three_windows_handshake_media_play_seek_pause_and_exit(window_factory, qt_app, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
     host, clients, movie = connected_windows(window_factory, qt_app, tmp_path)
-    for client in clients:
-        client._start_media_load(movie)
+    monkeypatch.setattr(file_transfer, "received_dir", lambda: tmp_path / "received")
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    for index in range(host.recipient_combo.count()):
+        host.recipient_combo.setCurrentIndex(index)
+        host._start_file_offer()
+        wait_until(qt_app, lambda: not host.transfer_active, timeout=5)
     wait_until(qt_app, lambda: host._playback_allowed() and all(client._playback_allowed() for client in clients))
     host._host_play()
     wait_until(qt_app, lambda: host.player.is_playing() and all(client.player.is_playing() for client in clients))
     assert max(abs(host.player.get_position_ms()-client.player.get_position_ms()) for client in clients) < 100
-    host._seek_relative(5000)
-    wait_until(qt_app, lambda: host.player.get_position_ms() >= 5000 and all(client.player.get_position_ms() >= 5000 for client in clients))
+    delayed_client = clients[1]
+    delayed_send = delayed_client.network.send
+    confirmations = []
+    def hold_confirmation(kind, payload=None, **kwargs):
+        if kind == "seek_ack":
+            confirmations.append(dict(payload))
+        else:
+            delayed_send(kind, payload, **kwargs)
+    monkeypatch.setattr(delayed_client.network, "send", hold_confirmation)
+    for _ in range(3):
+        host._seek_relative(5000)
+    assert not host.player.is_playing()
+    wait_until(qt_app, lambda: host._seek.local_ready and len(host._seek.waiting) == 1 and bool(confirmations))
+    assert all(not client.player.is_playing() for client in clients)
+    assert len({host.player.get_position_ms(), *(client.player.get_position_ms() for client in clients)}) == 1
+    delayed_send("seek_ack", confirmations[-1])
+    monkeypatch.setattr(delayed_client.network, "send", delayed_send)
+    wait_until(qt_app, lambda: not host._pending_command_id and all(not client._pending_command_id for client in clients))
+    assert host.player.is_playing() and all(client.player.is_playing() for client in clients)
+    assert host.player.get_position_ms() >= 15000
+    assert all(abs(host.player.get_position_ms()-client.player.get_position_ms()) < 100 for client in clients)
+    assert all(client.seek_feedback.amount_ms == 15000 for client in clients)
+    positions = [client.player.get_position_ms() for client in clients]
+    for client in clients:
+        client._seek_relative(-5000)
+        client._choose_media()
+        client._start_media_load(movie)
+    assert all(client.player.get_position_ms() >= position for client, position in zip(clients, positions))
+    assert all(len(client.player.opened) == 1 for client in clients)
     host._host_pause()
     wait_until(qt_app, lambda: not host._pending_command_id and all(not client._pending_command_id for client in clients))
     assert all(not client.player.is_playing() for client in clients)
     assert len({host.player.get_position_ms(), *(client.player.get_position_ms() for client in clients)}) == 1
+    replacement = tmp_path / "replacement.mp4"
+    replacement.write_bytes(b"replacement-video")
+    host._start_media_load(replacement)
+    wait_until(qt_app, lambda: host.state.local_ready and all(client.local_media is None for client in clients))
+    assert all(not client._playback_allowed() and not client.state.local_ready for client in clients)
+    # Restore readiness using the same user-facing host transfer path.
+    for index in range(host.recipient_combo.count()):
+        host.recipient_combo.setCurrentIndex(index)
+        host._start_file_offer()
+        wait_until(qt_app, lambda: not host.transfer_active, timeout=5)
+    wait_until(qt_app, lambda: host._playback_allowed() and all(client._playback_allowed() for client in clients))
     clients[0]._go_home()
     wait_until(qt_app, lambda: len(host.peers) == 1)
     assert host._playback_allowed()

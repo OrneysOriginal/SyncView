@@ -77,10 +77,16 @@ def test_ping_reply_is_personal_and_peer_cannot_control_host():
                 with pytest.raises(asyncio.TimeoutError):
                     await asyncio.wait_for(second.recv(), 0.02)
                 await first.send(encode_message(Message("play", {"command_id": 1, "position_ms": 0, "execute_delay_ms": 350, "execute_at": 100.0, "media_fingerprint": "x"}, session_id=host.session_id)))
+                await first.send(encode_message(Message("seek", {"command_id": 2, "position_ms": 5000,
+                    "execute_delay_ms": 350, "execute_at": 100.0, "media_fingerprint": "x"}, session_id=host.session_id)))
+                await first.send(encode_message(Message("file_offer", {"transfer_id": "forbidden",
+                    "file_name": "other.mp4", "file_size": 100, "fingerprint": "x"}, session_id=host.session_id)))
+                await first.send(encode_message(Message("seek_complete", {"seek_id": 1,
+                    "media_fingerprint": "x"}, session_id=host.session_id)))
                 await first.send(encode_message(Message("ready", {"media_loaded": True}, session_id=host.session_id)))
                 message = await event(inbox, "ready")
                 assert message.sender_id == id1
-                assert not any(item.type == "play" for item in list(inbox._queue))
+                assert not any(item.type in {"play", "seek", "file_offer", "seek_complete"} for item in list(inbox._queue))
             finally:
                 await first.close()
                 await second.close()
