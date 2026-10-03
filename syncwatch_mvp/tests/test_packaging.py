@@ -36,20 +36,23 @@ def test_spec_uses_current_pyinstaller_api_and_bundles_full_runtime(tmp_path, mo
 
 
 @pytest.mark.parametrize("smoke_test", [False, True])
-def test_startup_failure_returns_error_and_shows_dialog_when_interactive(monkeypatch, smoke_test):
+def test_entrypoint_preserves_exit_code_and_waits_for_startup_worker(monkeypatch, smoke_test):
     widgets = ModuleType("PySide6.QtWidgets")
     widgets.QApplication = Mock()
-    widgets.QMessageBox = Mock()
-    core = ModuleType("PySide6.QtCore")
-    core.QTimer = Mock()
+    widgets.QApplication.return_value.exec.return_value = 1
+    startup = ModuleType("src.ui.startup")
+    startup.StartupController = Mock()
     monkeypatch.setitem(sys.modules, "PySide6", ModuleType("PySide6"))
     monkeypatch.setitem(sys.modules, "PySide6.QtWidgets", widgets)
-    monkeypatch.setitem(sys.modules, "PySide6.QtCore", core)
+    monkeypatch.setitem(sys.modules, "src.ui.startup", startup)
     spec = importlib.util.spec_from_file_location("packaging_entrypoint", PROJECT / "src/main.py")
     entrypoint = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(entrypoint)
-    monkeypatch.setattr(entrypoint, "configure_logging", Mock())
-    monkeypatch.setattr(entrypoint, "configure_bundled_vlc", Mock(side_effect=RuntimeError("Missing VLC")))
+    log_path = Path("startup.log")
+    monkeypatch.setattr(entrypoint, "configure_logging", Mock(return_value=log_path))
     monkeypatch.setattr(sys, "argv", ["SyncWatch.exe"] + (["--smoke-test"] if smoke_test else []))
     assert entrypoint.main() == 1
-    assert widgets.QMessageBox.critical.called is not smoke_test
+    startup.StartupController.assert_called_once_with(
+        widgets.QApplication.return_value, log_path, smoke_test=smoke_test,
+    )
+    startup.StartupController.return_value.worker.wait.assert_called_once()

@@ -1,43 +1,23 @@
 from __future__ import annotations
 
-import logging
 import sys
 
-from PySide6.QtWidgets import QApplication, QMessageBox
-from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
 
-from src.infrastructure.bundled_vlc import configure_bundled_vlc
 from src.infrastructure.logger import configure_logging
+from src.ui.startup import StartupController
 
 
 def main() -> int:
-    configure_logging()
+    log_path = configure_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("SyncWatch")
+    startup = StartupController(app, log_path, smoke_test="--smoke-test" in sys.argv)
+    startup.start()
     try:
-        configure_bundled_vlc()
-        # Import after configuring VLC paths, inside the startup error handler.
-        from src.ui.main_window import MainWindow
-
-        window = MainWindow()
-    except Exception as exc:  # pragma: no cover - environment dependent
-        logging.exception("Application startup failed")
-        if "--smoke-test" in sys.argv:
-            return 1
-        QMessageBox.critical(
-            None,
-            "SyncWatch",
-            "Не удалось запустить приложение.\n\n"
-            f"{exc}\n\nПодробности: ~/.syncwatch/logs/syncwatch.log",
-        )
-        return 1
-    window.resize(1100, 720)
-    window.show()
-    if "--smoke-test" in sys.argv:
-        # Packaging check: create Qt, VLC and the network thread, then close
-        # through the normal window shutdown path. No video is played.
-        QTimer.singleShot(1000, window.close)
-    return app.exec()
+        return app.exec()
+    finally:
+        startup.worker.wait()
 
 
 if __name__ == "__main__":

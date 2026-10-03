@@ -65,7 +65,7 @@ class TransferSignals(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, *, vlc_instance=None) -> None:
         super().__init__()
         self.setWindowTitle("SyncWatch")
         self.resize(1080, 720)
@@ -103,7 +103,7 @@ class MainWindow(QMainWindow):
         self._build_home()
         self._build_host()
         self._build_connect()
-        self._build_player()
+        self._build_player(vlc_instance)
         # Start background work only after VLC has initialized successfully.
         self.network.start()
 
@@ -295,7 +295,7 @@ class MainWindow(QMainWindow):
         self.connect_page = self._shell("room", content)
         self.stack.addWidget(self.connect_page)
 
-    def _build_player(self) -> None:
+    def _build_player(self, vlc_instance=None) -> None:
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -326,7 +326,7 @@ class MainWindow(QMainWindow):
         )
         self.video_surface.clicked.connect(self._toggle_playback)
         self.video_surface.double_clicked.connect(self._toggle_fullscreen)
-        self.player = VlcPlayer(self.video_surface)
+        self.player = VlcPlayer(self.video_surface, instance=vlc_instance)
         video_layout.addWidget(self.video_surface, 1)
 
         self.player_controls = QFrame()

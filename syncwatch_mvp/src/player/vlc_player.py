@@ -10,23 +10,30 @@ from PySide6.QtWidgets import QWidget
 from src.player.interface import VideoPlayer
 
 
+def create_vlc_instance():
+    instance = vlc.Instance("--no-video-title-show")
+    if instance is None:
+        detail = vlc.libvlc_errmsg()
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
+        raise RuntimeError(
+            "VLC не смог инициализироваться. Проверьте полный комплект "
+            "libvlc.dll, libvlccore.dll и plugins одной версии и архитектуры.\n"
+            f"Библиотека: {os.environ.get('PYTHON_VLC_LIB_PATH', 'системный поиск')}\n"
+            f"Плагины: {os.environ.get('VLC_PLUGIN_PATH', 'системный поиск')}\n"
+            f"Сообщение VLC: {detail or 'подробности не предоставлены'}"
+        )
+    return instance
+
+
 class VlcPlayer(VideoPlayer):
-    def __init__(self, video_widget: QWidget) -> None:
-        self._instance = vlc.Instance("--no-video-title-show")
-        if self._instance is None:
-            detail = vlc.libvlc_errmsg()
-            if isinstance(detail, bytes):
-                detail = detail.decode("utf-8", errors="replace")
-            raise RuntimeError(
-                "VLC не смог инициализироваться. Проверьте полный комплект "
-                "libvlc.dll, libvlccore.dll и plugins одной версии и архитектуры.\n"
-                f"Библиотека: {os.environ.get('PYTHON_VLC_LIB_PATH', 'системный поиск')}\n"
-                f"Плагины: {os.environ.get('VLC_PLUGIN_PATH', 'системный поиск')}\n"
-                f"Сообщение VLC: {detail or 'подробности не предоставлены'}"
-            )
+    def __init__(self, video_widget: QWidget, *, instance=None) -> None:
+        owns_instance = instance is None
+        self._instance = create_vlc_instance() if owns_instance else instance
         self._player = self._instance.media_player_new()
         if self._player is None:
-            self._instance.release()
+            if owns_instance:
+                self._instance.release()
             raise RuntimeError("VLC инициализирован, но не смог создать медиаплеер.")
         self._widget = video_widget
         # VLC по умолчанию перехватывает мышь внутри нативного видеовывода.
