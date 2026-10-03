@@ -17,3 +17,6 @@ __pycache__/
 .venv-build/
 syncwatch_mvp/build/
 syncwatch_mvp/dist/
+/Точечный рисунок*.bmp
+/SyncWatch.exe
+/SyncWatch-Windows-*.zip
