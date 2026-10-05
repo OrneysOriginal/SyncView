@@ -210,6 +210,7 @@ class MainWindow(QMainWindow):
         self._generation = 0
         self._load_generation = 0
         self._closing = False
+        self._host_starting = False
         self._command_timers: list[QTimer] = []
         self._pending_command_id = 0
         self._pending_command: tuple[Message, float] | None = None
@@ -349,13 +350,20 @@ class MainWindow(QMainWindow):
         create = QPushButton("Создать комнату")
         create.setObjectName("primary")
         create.setFixedWidth(260)
-        create.clicked.connect(self._create_room)
+        create.clicked.connect(self._show_host_setup)
         connect = QPushButton("Подключиться")
         connect.setFixedWidth(260)
         connect.clicked.connect(lambda: self.stack.setCurrentWidget(self.connect_page))
         actions.addWidget(create, alignment=Qt.AlignmentFlag.AlignHCenter)
         actions.addWidget(connect, alignment=Qt.AlignmentFlag.AlignHCenter)
         layout.addLayout(actions)
+        self.home_notice = QLabel()
+        self.home_notice.setObjectName("muted")
+        self.home_notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.home_notice.setTextFormat(Qt.TextFormat.PlainText)
+        self.home_notice.setWordWrap(True)
+        self.home_notice.hide()
+        layout.addWidget(self.home_notice)
         layout.addStretch()
 
         footer = QLabel("Работает в локальной сети • можно передать видео участнику")
@@ -372,16 +380,30 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(16)
 
-        title = QLabel("Комната создана")
-        title.setObjectName("pageTitle")
-        subtitle = QLabel("Передайте IP, порт и код участникам.")
-        subtitle.setObjectName("muted")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        self.host_title = QLabel("Создать комнату")
+        self.host_title.setObjectName("pageTitle")
+        self.host_subtitle = QLabel("Укажите порт и код для новой комнаты.")
+        self.host_subtitle.setObjectName("muted")
+        layout.addWidget(self.host_title)
+        layout.addWidget(self.host_subtitle)
 
         card, card_l = self._card()
+        self.host_config = QWidget()
+        form = QFormLayout(self.host_config)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setVerticalSpacing(12)
+        self.host_port_edit = QSpinBox()
+        self.host_port_edit.setRange(1, 65535)
+        self.host_port_edit.setValue(45892)
+        self.host_code_edit = QLineEdit()
+        self.host_code_edit.setPlaceholderText("Пустое поле — случайный шестизначный код")
+        self.host_code_edit.setClearButtonEnabled(True)
+        form.addRow("Порт", self.host_port_edit)
+        form.addRow("Код комнаты", self.host_code_edit)
+        card_l.addWidget(self.host_config)
         self.host_info = QLabel()
         self.host_info.setObjectName("metricValue")
+        self.host_info.setTextFormat(Qt.TextFormat.PlainText)
         self.host_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.host_info.setWordWrap(True)
         self.host_status = QLabel("Подготовка…")
@@ -392,19 +414,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(card)
 
         actions = QHBoxLayout()
-        choose = QPushButton("Выбрать видео")
-        choose.setObjectName("primary")
-        choose.clicked.connect(self._choose_media)
-        close = QPushButton("Закрыть комнату")
-        close.setObjectName("danger")
-        close.clicked.connect(self._go_home)
-        actions.addWidget(choose)
-        actions.addWidget(close)
+        self.host_create_button = QPushButton("Создать комнату")
+        self.host_create_button.setObjectName("primary")
+        self.host_create_button.clicked.connect(self._create_room)
+        self.host_choose_button = QPushButton("Выбрать видео")
+        self.host_choose_button.setObjectName("primary")
+        self.host_choose_button.clicked.connect(self._choose_media)
+        self.host_close_button = QPushButton("Назад")
+        self.host_close_button.setObjectName("danger")
+        self.host_close_button.clicked.connect(self._go_home)
+        actions.addWidget(self.host_create_button)
+        actions.addWidget(self.host_choose_button)
+        actions.addWidget(self.host_close_button)
         actions.addStretch()
         layout.addLayout(actions)
         layout.addStretch()
         self.host_page = self._shell("room", content)
         self.stack.addWidget(self.host_page)
+        self._set_host_controls(running=False)
 
     def _build_connect(self) -> None:
         content = QWidget()
@@ -684,12 +711,40 @@ class MainWindow(QMainWindow):
         if self._fullscreen:
             self.video_surface.setCursor(Qt.CursorShape.BlankCursor)
 
+    def _set_host_controls(self, *, running: bool) -> None:
+        self.host_config.setVisible(not running)
+        self.host_config.setEnabled(not self._host_starting)
+        self.host_create_button.setVisible(not running)
+        self.host_create_button.setEnabled(not self._host_starting)
+        self.host_choose_button.setVisible(running)
+        self.host_close_button.setText("Закрыть комнату" if running else "Назад")
+        self.host_title.setText("Комната создана" if running else
+                                "Создаём комнату…" if self._host_starting else "Создать комнату")
+        self.host_subtitle.setText("Передайте IP, порт и код участникам." if running else
+                                   "Укажите порт и код для новой комнаты.")
+
+    def _show_host_setup(self) -> None:
+        self._go_home()
+        self._set_host_controls(running=False)
+        self.host_info.setText("Порт: 1–65535. Код: до 32 символов или пустое поле для случайного кода.")
+        self.host_status.setText("Готово к созданию комнаты")
+        self.stack.setCurrentWidget(self.host_page)
+
     def _create_room(self) -> None:
+        if self._host_starting:
+            return
+        port = self.host_port_edit.value()
+        code = self.host_code_edit.text().strip()
+        if not 1 <= port <= 65535 or len(code) > 32 or (code and not code.isprintable()):
+            self._show_error("Порт должен быть от 1 до 65535, код — до 32 печатных символов")
+            return
         self._go_home()
         self.state.role = Role.HOST
+        self._host_starting = True
+        self._set_host_controls(running=False)
         self.host_info.setText("Создаём комнату…")
         self.stack.setCurrentWidget(self.host_page)
-        self.network.host(45892)
+        self.network.host(port, code or None)
 
     def _connect_room(self) -> None:
         ip = self.ip_edit.text().strip()
@@ -1037,12 +1092,14 @@ class MainWindow(QMainWindow):
             return
         p, peer_id = message.payload, message.sender_id
         if message.type == "host_started" and self.state.role == Role.HOST:
+            self._host_starting = False
+            self._set_host_controls(running=True)
             self.peers.clear()
             self.state.connected = False
             self._invalidate_commands()
             self._reset_media_match_state()
             self.state.session_id = message.session_id
-            self.host_info.setText(f"IP: {self._local_ip()} • Порт: 45892 • Код: {p['room_code']}")
+            self.host_info.setText(f"IP: {self._local_ip()} • Порт: {p['port']} • Код: {p['room_code']}")
             return
         if message.type == "join_accepted" and self.state.role == Role.CLIENT:
             self.peers.clear()
@@ -1057,6 +1114,12 @@ class MainWindow(QMainWindow):
             self._check_media_match()
             return
         if message.session_id != self.state.session_id:
+            return
+        if (self.state.role == Role.CLIENT and peer_id == "host"
+                and message.type in {"session_ended", "peer_left"}):
+            self._end_client_session("Ведущий завершил сессию. Вы вышли из комнаты."
+                                     if message.type == "session_ended" else
+                                     "Связь с ведущим потеряна. Вы вышли из комнаты.")
             return
         if message.type == "peer_joined" and self.state.role == Role.HOST:
             self.peers[peer_id] = PeerState(p['device_name'])
@@ -1633,6 +1696,16 @@ class MainWindow(QMainWindow):
         self.connection_badge.setText("● " + text)
 
     def _network_failed(self, text: str) -> None:
+        if self.state.role == Role.NONE:
+            return
+        if self.state.role == Role.CLIENT and self.state.connected:
+            self._end_client_session("Связь с ведущим потеряна. Вы вышли из комнаты.")
+            return
+        if self.state.role == Role.HOST and self._host_starting:
+            self._host_starting = False
+            self.state = SessionState()
+            self._set_host_controls(running=False)
+            self.host_info.setText("Комната не создана. Исправьте настройки и попробуйте снова.")
         self._set_status(f"Ошибка соединения: {text}")
         if self.transfer_active:
             self._cleanup_transfer_state(send_cancel=False)
@@ -1643,7 +1716,21 @@ class MainWindow(QMainWindow):
             logging.warning("UI: %s", text)
             QMessageBox.warning(self, "SyncWatch", text)
 
+    def _end_client_session(self, reason: str) -> None:
+        # The host is gone: cancel locally without sending to a closed socket.
+        if self.transfer_active or self._incoming_offer_id:
+            self._cleanup_transfer_state(send_cancel=False)
+        self._go_home()
+        # A file offer may be running a modal event loop when disconnect arrives.
+        for dialog in self.findChildren(QMessageBox):
+            dialog.reject()
+        self.home_notice.setText(reason)
+        self.home_notice.show()
+
     def _go_home(self) -> None:
+        self._host_starting = False
+        self.home_notice.clear()
+        self.home_notice.hide()
         if self.transfer_active:
             self._cancel_file_transfer()
         self._incoming_offer_id = None

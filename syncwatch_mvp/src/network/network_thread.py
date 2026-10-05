@@ -92,9 +92,9 @@ class NetworkThread(QThread):
         future.add_done_callback(done)
         return future
 
-    def host(self, port: int) -> None:
+    def host(self, port: int, room_code: str | None = None) -> None:
         if self._ready.wait(1):
-            self._submit(self.manager.host(port))
+            self._submit(self.manager.host(port, room_code))
 
     def connect_to(self, ip: str, port: int, room_code: str, device_name: str) -> None:
         if self._ready.wait(1):

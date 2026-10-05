@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from contextlib import asynccontextmanager
 
 import pytest
@@ -135,4 +136,44 @@ def test_malformed_peer_is_closed_without_interrupting_other_peer():
                 assert (await event(inbox, "ready")).sender_id == id2
             finally:
                 await second.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("port,code", [(-1, None), (65536, None), (True, None),
+                                     (45892, "x" * 33), (45892, "a\nb"), (45892, 123)])
+def test_invalid_host_settings_preserve_existing_room(port, code):
+    async def scenario():
+        async with host_room() as (host, inbox, uri):
+            server, session = host.server, host.session_id
+            with pytest.raises(ValueError):
+                await host.host(port, code)
+            assert host.server is server and host.session_id == session and host.is_host
+            socket, _ = await joined(uri, host, "still-open")
+            await socket.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("error,fragment", [
+    (errno.EADDRINUSE, "уже занят"), (errno.EACCES, "Нет доступа"),
+    (errno.EADDRNOTAVAIL, "Не удалось запустить"), (10048, "уже занят"), (10013, "Нет доступа"),
+])
+def test_bind_errors_report_port_and_leave_no_started_room(monkeypatch, error, fragment):
+    from src.network import connection_manager
+
+    async def failing_serve(*args, **kwargs):
+        raise OSError(error, "bind failed")
+    monkeypatch.setattr(connection_manager, "serve", failing_serve)
+    async def scenario():
+        events = []
+        async def receive(message):
+            events.append(message)
+        host = ConnectionManager(receive, lambda text: None)
+        try:
+            with pytest.raises(ConnectionError, match=fragment) as failure:
+                await host.host(52600, "friends")
+            assert "52600" in str(failure.value)
+            assert host.server is None and not host.is_host and not host.session_id
+            assert not any(message.type == "host_started" for message in events)
+        finally:
+            await host.close()
     asyncio.run(scenario())

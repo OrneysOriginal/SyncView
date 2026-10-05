@@ -560,3 +560,147 @@ def test_client_timeout_and_late_play_do_not_bypass_failure(window_factory, qt_a
     late_play = {**payload, "command_id": payload["command_id"] + 1, "resume": True}
     client._on_message(Message("play", late_play, session_id="room", sender_id="host"))
     assert not client.player.is_playing() and not client._command_timers
+
+
+@pytest.mark.parametrize("kind", ["session_ended", "peer_left"])
+def test_host_exit_returns_client_home_and_cancels_pending_play(window_factory, qt_app, kind):
+    client = ready(window_factory(), Role.CLIENT)
+    client._enter_fullscreen()
+    client.player.play()
+    client._on_message(Message("play", {"command_id": 1, "position_ms": 1234, "resume": True,
+        "execute_delay_ms": 350, "execute_at": time.monotonic()+0.35, "media_fingerprint": "fingerprint"},
+        session_id="room", sender_id="host"))
+    assert client._pending_command_id
+    client._on_message(Message(kind, session_id="room", sender_id="host"))
+    assert client.stack.currentWidget() == client.home_page and not client._fullscreen
+    assert client.state.role == Role.NONE and not client.state.connected and not client.state.session_id
+    assert not client.peers and client.local_media is None and client.local_media_path is None
+    assert not client._command_timers and not client._pending_command_id and not client.player.is_playing()
+    assert "вышли из комнаты" in client.home_notice.text()
+    client.network.leave_room.assert_called_once()
+    client._network_failed("Запоздалая ошибка отправки")
+    assert not client.test_errors
+
+
+def test_old_session_end_cannot_close_current_room(window_factory):
+    client = ready(window_factory(), Role.CLIENT)
+    client._on_message(Message("session_ended", session_id="old-room", sender_id="host"))
+    assert client.state.connected and client.stack.currentWidget() == client.player_page
+    host = ready(window_factory())
+    host._on_message(Message("session_ended", session_id="room", sender_id="p0"))
+    assert host.state.connected and host.stack.currentWidget() == host.player_page
+
+
+def test_host_exit_cancels_receiving_file_without_network_reply(window_factory, tmp_path):
+    from src.network.file_transfer import FileTransferReceiver
+
+    client = ready(window_factory(), Role.CLIENT)
+    receiver = FileTransferReceiver({"transfer_id": "t", "file_name": "movie", "file_size": 100,
+                                    "fingerprint": "fingerprint"}, tmp_path)
+    client._transfer_receiver = receiver
+    client._transfer_peer = "host"
+    client.transfer_active = True
+    client.transfer_timeout.start()
+    client._on_message(Message("peer_left", session_id="room", sender_id="host"))
+    assert receiver.cancel_event.is_set() and not client.transfer_active
+    assert not client.transfer_timeout.isActive()
+    client.network.stop_receiving.assert_called_once()
+    client.network.send.assert_not_called()
+    receiver.cleanup()  # Real NetworkThread performs this cleanup on its disk worker.
+
+
+def test_host_exit_dismisses_open_file_offer(window_factory, qt_app):
+    from PySide6.QtCore import QTimer
+
+    client = ready(window_factory(), Role.CLIENT)
+    QTimer.singleShot(20, lambda: client._on_message(Message("session_ended", session_id="room", sender_id="host")))
+    client._handle_file_offer({"transfer_id": "offer", "file_name": "movie", "file_size": 100,
+                              "fingerprint": "fingerprint"}, "host")
+    assert client.stack.currentWidget() == client.home_page
+    assert not client._incoming_offer_id and not client.transfer_active and not client._transfer_receiver
+
+
+def test_connection_error_exits_joined_client_but_keeps_join_form_on_failure(window_factory):
+    client = ready(window_factory(), Role.CLIENT)
+    client._network_failed("Соединение потеряно")
+    assert client.stack.currentWidget() == client.home_page and client.state.role == Role.NONE
+    assert not client.test_errors
+    pending = window_factory()
+    pending.state.role = Role.CLIENT
+    pending.stack.setCurrentWidget(pending.connect_page)
+    pending._network_failed("Неверный код")
+    assert pending.stack.currentWidget() == pending.connect_page
+    assert pending.test_errors[-1] == "Неверный код"
+
+
+def test_create_button_opens_settings_before_starting_server(window_factory):
+    from PySide6.QtWidgets import QPushButton
+
+    window = window_factory()
+    button = next(button for button in window.home_page.findChildren(QPushButton)
+                  if button.text() == "Создать комнату")
+    button.click()
+    assert window.stack.currentWidget() == window.host_page
+    assert window.host_port_edit.value() == 45892 and not window.host_code_edit.text()
+    window.network.host.assert_not_called()
+    assert window.state.role == Role.NONE and not window.host_choose_button.isVisible()
+
+
+def test_create_room_uses_selected_port_and_code_and_ignores_double_click(window_factory):
+    window = window_factory()
+    window._show_host_setup()
+    window.host_port_edit.setValue(52600)
+    window.host_code_edit.setText("  friends-123  ")
+    window.host_create_button.click()
+    window._create_room()
+    window.network.host.assert_called_once_with(52600, "friends-123")
+    assert window._host_starting and not window.host_create_button.isEnabled()
+    window._on_message(Message("host_started", {"port": 52600, "room_code": "friends-123"}, session_id="new"))
+    assert "Порт: 52600" in window.host_info.text() and "Код: friends-123" in window.host_info.text()
+    assert not window._host_starting and window.host_config.isHidden() and window.host_create_button.isHidden()
+    assert not window.host_choose_button.isHidden() and window.host_title.text() == "Комната создана"
+
+
+def test_blank_room_code_requests_automatic_generation(window_factory):
+    window = window_factory()
+    window._show_host_setup()
+    window.host_code_edit.setText("   ")
+    window._create_room()
+    window.network.host.assert_called_once_with(45892, None)
+
+
+def test_invalid_room_code_does_not_start_server(window_factory):
+    window = window_factory()
+    window._show_host_setup()
+    window.host_code_edit.setText("x" * 33)
+    window._create_room()
+    window.network.host.assert_not_called()
+    assert not window._host_starting and window.state.role == Role.NONE
+    assert "32" in window.test_errors[-1]
+
+
+def test_host_start_failure_keeps_settings_editable_for_retry(window_factory):
+    window = window_factory()
+    window._show_host_setup()
+    window.host_port_edit.setValue(52600)
+    window.host_code_edit.setText("friends")
+    window._create_room()
+    window._network_failed("Порт 52600 уже занят")
+    assert window.host_title.text() == "Создать комнату" and window.host_create_button.isEnabled()
+    assert window.host_config.isEnabled() and not window._host_starting
+    assert window.state.role == Role.NONE and not window.state.session_id
+    assert window.host_port_edit.value() == 52600 and window.host_code_edit.text() == "friends"
+    assert "уже занят" in window.host_status.text() and "уже занят" in window.test_errors[-1]
+    window.host_port_edit.setValue(52601)
+    window._create_room()
+    assert window.network.host.call_args.args == (52601, "friends")
+
+
+def test_cancel_host_start_ignores_late_success(window_factory):
+    window = window_factory()
+    window._show_host_setup()
+    window._create_room()
+    window._go_home()
+    window._on_message(Message("host_started", {"port": 45892, "room_code": "123456"}, session_id="old"))
+    assert window.stack.currentWidget() == window.home_page
+    assert not window._host_starting and window.state.role == Role.NONE

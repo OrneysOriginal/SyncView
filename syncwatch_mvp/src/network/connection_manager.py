@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import ipaddress
 import logging
 import secrets
@@ -18,6 +19,9 @@ from src.version import APP_VERSION
 
 MessageHandler = Callable[[Message], Awaitable[None]]
 StatusHandler = Callable[[str], None]
+
+PING_INTERVAL_SECONDS = 5
+PING_TIMEOUT_SECONDS = 5
 
 
 class ConnectionManager:
@@ -40,17 +44,40 @@ class ConnectionManager:
     def connected(self) -> bool:
         return bool(self.clients) if self.is_host else self.websocket is not None
 
-    async def host(self, port: int) -> None:
+    async def host(self, port: int, room_code: str | None = None) -> None:
+        if type(port) is not int or not 0 <= port <= 65535:
+            raise ValueError("Порт должен быть числом от 1 до 65535")
+        if room_code is not None and not isinstance(room_code, str):
+            raise ValueError("Код комнаты должен быть текстом")
+        code = (room_code or "").strip()
+        if len(code) > 32 or (code and not code.isprintable()):
+            raise ValueError("Код комнаты должен содержать от 1 до 32 печатных символов")
         async with self._lifecycle_lock:
             await self._close()
             self.is_host = True
             self.session_id = secrets.token_hex(16)
-            self.room_code = f"{secrets.randbelow(1000000):06d}"
+            self.room_code = code or f"{secrets.randbelow(1000000):06d}"
             self._room_code_expected = self.room_code
-            self.server = await serve(self._accept_client, "0.0.0.0", port,
-                                      max_size=MAX_MESSAGE_SIZE, max_queue=4,
-                                      compression=None, close_timeout=2)
-            await self.on_message(Message("host_started", {"room_code": self.room_code}, session_id=self.session_id))
+            try:
+                self.server = await serve(self._accept_client, "0.0.0.0", port,
+                                          max_size=MAX_MESSAGE_SIZE, max_queue=4,
+                                          compression=None, close_timeout=2,
+                                          ping_interval=PING_INTERVAL_SECONDS, ping_timeout=PING_TIMEOUT_SECONDS)
+            except OSError as exc:
+                self.is_host = False
+                self.session_id = ""
+                self._room_code_expected = ""
+                errors = {exc.errno, getattr(exc, "winerror", None)}
+                if errors & {errno.EADDRINUSE, 10048}:
+                    reason = f"Порт {port} уже занят. Выберите другой порт или освободите этот."
+                elif errors & {errno.EACCES, errno.EPERM, 10013}:
+                    reason = f"Нет доступа к порту {port}. Выберите другой порт или проверьте ограничения системы."
+                else:
+                    reason = f"Не удалось запустить комнату на порту {port}: {exc.strerror or str(exc)}"
+                raise ConnectionError(reason) from exc
+            actual_port = self.server.sockets[0].getsockname()[1]
+            await self.on_message(Message("host_started", {"room_code": self.room_code, "port": actual_port},
+                                          session_id=self.session_id))
             self.on_status("Сервер запущен. Ожидание участников…")
 
     async def _accept_client(self, websocket: ServerConnection) -> None:
@@ -101,7 +128,8 @@ class ConnectionManager:
         accepted = False
         try:
             websocket = await connect(f"ws://{host}:{port}", proxy=None, max_size=MAX_MESSAGE_SIZE,
-                                      max_queue=4, compression=None, open_timeout=10, close_timeout=2)
+                                      max_queue=4, compression=None, open_timeout=10, close_timeout=2,
+                                      ping_interval=PING_INTERVAL_SECONDS, ping_timeout=PING_TIMEOUT_SECONDS)
             self.websocket = websocket
             await self.send("join", {"room_code": room_code, "device_name": device_name,
                                      "app_version": APP_VERSION})
@@ -190,6 +218,12 @@ class ConnectionManager:
             await asyncio.gather(connecting, return_exceptions=True)
         self._connecting = None
         sockets = tuple(self.clients.values()) + ((self.websocket,) if self.websocket else ())
+        if self.is_host and self.clients:
+            try:
+                await asyncio.wait_for(self.send("session_ended"), timeout=1)
+            except (TimeoutError, ConnectionClosed):
+                # Socket closure / heartbeat also ends the room if delivery fails.
+                logging.debug("Unable to announce session end before closing")
         if self.server is not None:
             self.server.close()
         await asyncio.gather(*(ws.close() for ws in sockets), return_exceptions=True)
