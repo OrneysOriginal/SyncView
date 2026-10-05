@@ -205,7 +205,13 @@ class FileTransferReceiver:
             try:
                 with self.final_path.open("xb") as output, self.part_path.open("rb") as source:
                     created = True
-                    shutil.copyfileobj(source, output, CHUNK_SIZE)
+                    while True:
+                        if self.cancel_event.is_set():
+                            raise RuntimeError("Передача отменена")
+                        block = source.read(CHUNK_SIZE)
+                        if not block:
+                            break
+                        output.write(block)
             except Exception:
                 if created:
                     self.final_path.unlink(missing_ok=True)

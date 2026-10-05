@@ -21,7 +21,7 @@ if sys.platform == "win32":
 
 # Bundle the complete runtime. VLC discovers codecs and outputs through plugins,
 # so copying only libvlc is insufficient.
-datas = [(str(vlc_source), "vlc")]
+datas = [(str(vlc_source), "vlc"), (str(project / "assets"), "assets")]
 hiddenimports = collect_submodules("websockets")
 
 a = Analysis(
@@ -50,6 +50,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(project / "assets" / "syncwatch.ico") if sys.platform == "win32" else None,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

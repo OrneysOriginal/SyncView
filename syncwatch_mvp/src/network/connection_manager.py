@@ -211,6 +211,14 @@ class ConnectionManager:
 
     async def _close(self) -> None:
         self._closing = True
+        # Existing listeners must stay valid until the final message is sent.
+        # Invalidating them earlier lets an in-flight ready/ping close a socket
+        # before session_ended reaches that participant.
+        if self.is_host and self.clients:
+            try:
+                await asyncio.wait_for(self.send("session_ended"), timeout=1)
+            except (asyncio.TimeoutError, ConnectionClosed):
+                logging.debug("Unable to announce session end before closing")
         self._generation += 1
         connecting = self._connecting
         if connecting is not None and connecting is not asyncio.current_task():
@@ -218,12 +226,6 @@ class ConnectionManager:
             await asyncio.gather(connecting, return_exceptions=True)
         self._connecting = None
         sockets = tuple(self.clients.values()) + ((self.websocket,) if self.websocket else ())
-        if self.is_host and self.clients:
-            try:
-                await asyncio.wait_for(self.send("session_ended"), timeout=1)
-            except (TimeoutError, ConnectionClosed):
-                # Socket closure / heartbeat also ends the room if delivery fails.
-                logging.debug("Unable to announce session end before closing")
         if self.server is not None:
             self.server.close()
         await asyncio.gather(*(ws.close() for ws in sockets), return_exceptions=True)

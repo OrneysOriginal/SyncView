@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
@@ -105,15 +107,25 @@ class NetworkThread(QThread):
             self._submit(self.manager.send(message_type, payload, recipient_id))
 
     def send_wait(self, message_type: str, payload: dict | None = None, timeout: float = 30.0,
-                  recipient_id: str | None = None) -> None:
+                  recipient_id: str | None = None, cancel_event: threading.Event | None = None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
         if not self._ready.wait(1):
             raise RuntimeError("Сетевой поток недоступен")
         future = asyncio.run_coroutine_threadsafe(self.manager.send(message_type, payload, recipient_id), self.loop)
-        try:
-            future.result(timeout=timeout)
-        except TimeoutError:
-            future.cancel()
-            raise
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                future.cancel()
+                raise CancelledError()
+            remaining = deadline - time.monotonic()
+            try:
+                future.result(timeout=max(0, min(0.05, remaining)))
+                return
+            except FutureTimeoutError:
+                if future.done() or remaining <= 0:
+                    future.cancel()
+                    raise
 
     def start_receiving(self, receiver, peer_id: str) -> None:
         def set_receiver():

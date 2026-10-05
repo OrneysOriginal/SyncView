@@ -110,6 +110,53 @@ def test_close_frees_port_and_new_room_has_new_identity():
     asyncio.run(scenario())
 
 
+def test_session_end_precedes_socket_close_with_in_flight_client_message():
+    async def scenario():
+        async with host_room() as (host, inbox, uri):
+            socket, _ = await joined(uri, host, "one")
+            started, release = asyncio.Event(), asyncio.Event()
+            original_send = host.send
+
+            async def delayed_send(kind, *args, **kwargs):
+                if kind == "session_ended":
+                    started.set()
+                    await release.wait()
+                await original_send(kind, *args, **kwargs)
+
+            host.send = delayed_send
+            closer = asyncio.create_task(host.close())
+            try:
+                await asyncio.wait_for(started.wait(), 1)
+                await socket.send(encode_message(Message("ready", {"media_loaded": False},
+                                                         session_id=host.session_id)))
+                # The listener must not close the socket while the final message
+                # is still waiting to be sent.
+                await event(inbox, "ready")
+                release.set()
+                final = decode_message(await asyncio.wait_for(socket.recv(), 2))
+                assert final.type == "session_ended"
+            finally:
+                release.set()
+                await closer
+                await socket.close()
+    asyncio.run(scenario())
+
+
+def test_session_end_timeout_still_releases_sockets_and_port():
+    async def scenario():
+        async with host_room() as (host, inbox, uri):
+            socket, _ = await joined(uri, host, "one")
+
+            async def timeout(*args, **kwargs):
+                raise asyncio.TimeoutError()
+
+            host.send = timeout
+            await host.close()
+            await asyncio.wait_for(socket.wait_closed(), 2)
+            assert host.server is None and not host.connected
+    asyncio.run(scenario())
+
+
 def test_client_failed_join_leaves_no_socket():
     async def scenario():
         async with host_room() as (host, inbox, uri):

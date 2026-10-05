@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, QTimer, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QPainter, QPolygonF
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -39,6 +41,7 @@ from src.player.vlc_player import VlcPlayer
 from src.session.role import Role
 from src.session.state import PeerState, SeekState, SessionState
 from src.synchronization.drift_calculator import calculate_drift_ms, needs_correction
+from src.ui.app_icon import application_icon
 from src.ui.theme import APP_STYLE
 from src.version import APP_VERSION
 
@@ -202,6 +205,7 @@ class MainWindow(QMainWindow):
     def __init__(self, *, vlc_instance=None) -> None:
         super().__init__()
         self.setWindowTitle(f"SyncWatch {APP_VERSION}")
+        self.setWindowIcon(application_icon())
         self.resize(1080, 720)
         self.setMinimumSize(860, 600)
         self.setStyleSheet(APP_STYLE)
@@ -209,6 +213,7 @@ class MainWindow(QMainWindow):
         self.peers: dict[str, PeerState] = {}
         self._generation = 0
         self._load_generation = 0
+        self._load_cancel = Event()
         self._closing = False
         self._host_starting = False
         self._command_timers: list[QTimer] = []
@@ -275,6 +280,7 @@ class MainWindow(QMainWindow):
         self.state_timer = QTimer(self)
         self.state_timer.timeout.connect(self._send_state)
         self.state_timer.start(500)
+        QApplication.instance().aboutToQuit.connect(self.close)
 
     def _shell(self, active: str, content: QWidget) -> QWidget:
         root = QWidget()
@@ -787,6 +793,8 @@ class MainWindow(QMainWindow):
         ):
             return
         self._invalidate_commands()
+        self._load_cancel.set()
+        self._load_cancel = cancel_event = Event()
         self._load_generation += 1
         generation = self._load_generation
         self.local_media = None
@@ -807,14 +815,14 @@ class MainWindow(QMainWindow):
 
         def work():
             name, size = basic_file_data(path)
-            fingerprint = calculate_fingerprint(path)
+            fingerprint = calculate_fingerprint(path, cancel_event=cancel_event)
             if size != Path(path).stat().st_size:
                 raise ValueError("Размер файла изменился во время проверки")
             return generation, MediaInfo(name, size, 0, fingerprint), deadline
 
         future = self.executor.submit(work)
         def done(result):
-            if result.cancelled():
+            if result.cancelled() or cancel_event.is_set():
                 return
             error = result.exception()
             if error is not None:
@@ -967,8 +975,9 @@ class MainWindow(QMainWindow):
             self._host_pause()
         peer_id = self._transfer_peer
         def send(kind, payload):
-            self.network.send_wait(kind, payload, recipient_id=peer_id)
-        self._transfer_sender = FileTransferSender(self.local_media_path, self.local_media, send=send)
+            self.network.send_wait(kind, payload, recipient_id=peer_id, cancel_event=sender.cancel_event)
+        sender = FileTransferSender(self.local_media_path, self.local_media, send=send)
+        self._transfer_sender = sender
         self.transfer_active = True
         self._transfer_running = False
         self.transfer_timeout.start()
@@ -995,8 +1004,11 @@ class MainWindow(QMainWindow):
                 sender.run()
                 if not sender.cancel_event.is_set():
                     signals.finished.emit(token)
+            except CancelledError:
+                return
             except Exception as exc:
-                signals.failed.emit(token, str(exc))
+                if not sender.cancel_event.is_set():
+                    signals.failed.emit(token, str(exc))
         self.executor.submit(work)
 
     def _outgoing_progress(self, token: str, fraction: float, text: str) -> None:
@@ -1160,6 +1172,7 @@ class MainWindow(QMainWindow):
             ):
                 if self.transfer_active or self._incoming_offer_id:
                     self._cleanup_transfer_state(send_cancel=True)
+                self._load_cancel.set()
                 self._load_generation += 1
                 self.player.stop()
                 self.local_media = None
@@ -1541,7 +1554,7 @@ class MainWindow(QMainWindow):
         self.fullscreen_button.setText("🗗")
         self._show_player_controls()
         self.showFullScreen()
-        QTimer.singleShot(0, self.player.bind_video_output)
+        QTimer.singleShot(0, lambda: self.player.bind_video_output() if not self._closing else None)
 
     def _exit_fullscreen(self) -> None:
         if not self._fullscreen:
@@ -1562,7 +1575,7 @@ class MainWindow(QMainWindow):
         )
         self.fullscreen_button.setText("⛶")
         self._show_player_controls()
-        QTimer.singleShot(0, self.player.bind_video_output)
+        QTimer.singleShot(0, lambda: self.player.bind_video_output() if not self._closing else None)
 
     def _host_play(self) -> None:
         if self.state.role == Role.HOST and self._playback_allowed():
@@ -1728,6 +1741,7 @@ class MainWindow(QMainWindow):
         self.home_notice.show()
 
     def _go_home(self) -> None:
+        self._load_cancel.set()
         self._host_starting = False
         self.home_notice.clear()
         self.home_notice.hide()
@@ -1739,7 +1753,7 @@ class MainWindow(QMainWindow):
         self._load_generation += 1
         self.network.leave_room()
         self.player.stop()
-        if self._fullscreen:
+        if self._fullscreen and not self._closing:
             self._exit_fullscreen()
         self.peers.clear()
         self.state = SessionState()
@@ -1818,11 +1832,17 @@ class MainWindow(QMainWindow):
         super().hideEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._closing:
+            event.accept()
+            return
         self._closing = True
+        started = time.monotonic()
         self.ui_timer.stop()
         self.state_timer.stop()
+        self.controls_hide_timer.stop()
         self._go_home()
-        self.executor.shutdown(wait=False, cancel_futures=True)
         self.network.shutdown()
+        self.executor.shutdown(wait=True, cancel_futures=True)
         self.player.release()
+        logging.info("Application shutdown completed in %.3f seconds", time.monotonic() - started)
         super().closeEvent(event)

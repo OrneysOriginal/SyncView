@@ -31,7 +31,10 @@ def test_spec_uses_current_pyinstaller_api_and_bundles_full_runtime(tmp_path, mo
     spec = PROJECT / "packaging/syncwatch.spec"
     runpy.run_path(str(spec), init_globals={"SPEC": str(spec), **constructors})
     assert constructors["EXE"].call_args.kwargs["console"] is False
-    assert constructors["Analysis"].call_args.kwargs["datas"] == [(str(runtime), "vlc")]
+    assert constructors["Analysis"].call_args.kwargs["datas"] == [
+        (str(runtime), "vlc"), (str(PROJECT / "assets"), "assets")]
+    icon = Path(constructors["EXE"].call_args.kwargs["icon"])
+    assert icon == PROJECT / "assets" / "syncwatch.ico" and icon.is_file()
     assert constructors["COLLECT"].call_args.args[-1] is analysis.datas
 
 
@@ -42,9 +45,13 @@ def test_entrypoint_preserves_exit_code_and_waits_for_startup_worker(monkeypatch
     widgets.QApplication.return_value.exec.return_value = 1
     startup = ModuleType("src.ui.startup")
     startup.StartupController = Mock()
+    icon = ModuleType("src.ui.app_icon")
+    icon.application_icon = Mock()
+    icon.configure_windows_identity = Mock()
     monkeypatch.setitem(sys.modules, "PySide6", ModuleType("PySide6"))
     monkeypatch.setitem(sys.modules, "PySide6.QtWidgets", widgets)
     monkeypatch.setitem(sys.modules, "src.ui.startup", startup)
+    monkeypatch.setitem(sys.modules, "src.ui.app_icon", icon)
     spec = importlib.util.spec_from_file_location("packaging_entrypoint", PROJECT / "src/main.py")
     entrypoint = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(entrypoint)
@@ -56,3 +63,6 @@ def test_entrypoint_preserves_exit_code_and_waits_for_startup_worker(monkeypatch
         widgets.QApplication.return_value, log_path, smoke_test=smoke_test,
     )
     startup.StartupController.return_value.worker.wait.assert_called_once()
+    startup.StartupController.return_value.window.close.assert_called_once()
+    widgets.QApplication.return_value.setWindowIcon.assert_called_once_with(icon.application_icon.return_value)
+    icon.configure_windows_identity.assert_called_once()
