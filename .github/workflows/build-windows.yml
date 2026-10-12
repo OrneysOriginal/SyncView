@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Version matching src/version.py (v0.2.0-beta.1); leave empty for build only'
+        description: 'Version matching src/version.py (v0.2.0); leave empty for build only'
         required: false
         default: ''
         type: string
@@ -86,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]; then
-            echo "Use a new version tag such as v0.1.0 or v0.1.0-beta.1" >&2
+            echo "Use a new version tag such as v0.2.0" >&2
             exit 1
           fi
           cat > release-notes.md <<'NOTES'
@@ -108,7 +108,7 @@ jobs:
           Сборщик выполняет регрессионные тесты и проверяет декодирование AVI,
           Play/Pause/Seek внутри готового пакета. Просмотр со звуком на нескольких
           физических компьютерах проверяется отдельно. Результаты и ограничения:
-          `syncwatch_mvp/AUDIT.md`. Версия предназначена для предварительного тестирования.
+          `syncwatch_mvp/AUDIT.md`.
           NOTES
           # Create a new tag at exactly the commit that was built. Existing tags
           # fail instead of attaching a new binary to a different source version.
@@ -116,7 +116,6 @@ jobs:
             -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$SOURCE_COMMIT"
           gh release create "$RELEASE_TAG" \
             --repo "$GH_REPO" --verify-tag --draft \
-            --prerelease \
             --title "SyncWatch $RELEASE_TAG — Windows x64" \
             --notes-file release-notes.md \
             "release-assets/SyncWatch-Windows-x64.zip"

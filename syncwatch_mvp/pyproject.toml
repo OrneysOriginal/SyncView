@@ -1,6 +1,6 @@
 [project]
 name = "syncwatch"
-version = "0.2.0b1"
+version = "0.2.0"
 description = "Shared playback of local videos over a LAN"
 requires-python = ">=3.10"
 
