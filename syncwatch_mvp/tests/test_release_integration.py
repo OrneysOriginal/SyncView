@@ -69,8 +69,6 @@ def test_three_windows_handshake_media_play_seek_pause_and_exit(window_factory, 
     positions = [client.player.get_position_ms() for client in clients]
     for client in clients:
         client._seek_relative(-5000)
-        client._choose_media()
-        client._start_media_load(movie)
     assert all(client.player.get_position_ms() >= position for client, position in zip(clients, positions))
     assert all(len(client.player.opened) == 1 for client in clients)
     host._host_pause()

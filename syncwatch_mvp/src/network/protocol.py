@@ -4,12 +4,14 @@ import json
 import math
 from typing import Any
 
+from src.media.local_check import HASH_BATCH_SIZE
 from src.network.messages import PROTOCOL_VERSION, Message
 
 MAX_MESSAGE_SIZE = 1 * 1024 * 1024
 ALLOWED_TYPES = {
     "join", "join_accepted", "join_rejected", "disconnect", "error", "ping", "pong",
     "media_info", "media_match", "media_mismatch", "media_force_match",
+    "media_selected", "media_check_request", "media_check_reply",
     "ready", "not_ready",
     "play", "pause", "seek", "stop", "state", "sync_correction",
     "seek_ack", "seek_complete", "seek_failed",
@@ -20,7 +22,7 @@ ALLOWED_TYPES = {
 }
 
 HOST_COMMANDS = {"play", "pause", "seek", "stop", "sync_correction", "media_force_match", "session_ended",
-                 "file_offer", "seek_complete"}
+                 "file_offer", "seek_complete", "media_check_reply", "media_selected"}
 
 
 def validate_payload(kind: str, data: dict) -> None:
@@ -42,6 +44,8 @@ def validate_payload(kind: str, data: dict) -> None:
         string("room_code", 32)
         if "device_name" in data:
             string("device_name", 128)
+    if kind == "media_selected":
+        string("file_name", 255)
     if kind in {"media_info", "file_offer"}:
         string("file_name", 255)
         string("fingerprint", 128)
@@ -52,6 +56,22 @@ def validate_payload(kind: str, data: dict) -> None:
             raise ValueError("Отсутствует duration_ms")
     if kind in {"ready", "not_ready"}:
         boolean("media_loaded")
+    if kind in {"media_check_request", "media_check_reply"}:
+        string("check_id", 128)
+        string("media_fingerprint", 128)
+        integer("offset", 0, 16 * 1024**2)
+        if kind == "media_check_request":
+            integer("count", 1, HASH_BATCH_SIZE)
+        elif "reason" in data:
+            string("reason")
+            if "hashes" in data:
+                raise ValueError("Ответ проверки содержит и ошибку, и контрольные суммы")
+        else:
+            hashes = data.get("hashes")
+            if (not isinstance(hashes, list) or not 1 <= len(hashes) <= HASH_BATCH_SIZE
+                    or any(not isinstance(value, str) or len(value) != 64
+                           or any(char not in "0123456789abcdef" for char in value) for value in hashes)):
+                raise ValueError("Некорректные контрольные суммы блоков")
     if kind in {"play", "pause", "seek", "sync_correction"}:
         integer("command_id", 1)
         integer("position_ms")

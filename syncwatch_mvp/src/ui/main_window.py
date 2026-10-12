@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.media.fingerprint import calculate_fingerprint
+from src.media.local_check import LocalFileCheck
 from src.media.metadata import MediaInfo, basic_file_data
 from src.media.validator import media_matches
 from src.network.file_transfer import FileTransferReceiver, FileTransferSender
@@ -86,6 +87,7 @@ class VideoSurface(QWidget):
 class WorkerSignals(QObject):
     finished = Signal(object)
     failed = Signal(object)
+    progress = Signal(object)
 
 
 class SeekSlider(QSlider):
@@ -214,6 +216,9 @@ class MainWindow(QMainWindow):
         self._generation = 0
         self._load_generation = 0
         self._load_cancel = Event()
+        self._local_check: LocalFileCheck | None = None
+        self._block_hashes: tuple[bytes, ...] = ()
+        self._host_file_signature: tuple[int, int] | None = None
         self._closing = False
         self._host_starting = False
         self._command_timers: list[QTimer] = []
@@ -246,6 +251,7 @@ class MainWindow(QMainWindow):
         self.last_command_id = 0
         self.local_media: MediaInfo | None = None
         self.remote_media: MediaInfo | None = None
+        self._host_selected_name: str | None = None
         self.local_media_path: Path | None = None
         self.dragging = False
         self.last_correction = 0.0
@@ -614,6 +620,9 @@ class MainWindow(QMainWindow):
         self.drift_label.setObjectName("muted")
         self.choose_media_button = QPushButton("Сменить файл")
         self.choose_media_button.clicked.connect(self._choose_media)
+        self.cancel_check_button = QPushButton("Отменить проверку")
+        self.cancel_check_button.clicked.connect(self._cancel_local_check)
+        self.cancel_check_button.hide()
         self.send_file_button = QPushButton("Отправить файл")
         self.send_file_button.setToolTip("Отправить выбранный видеофайл на другое устройство по локальной сети")
         self.send_file_button.clicked.connect(self._start_file_offer)
@@ -640,8 +649,14 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.recipient_combo)
         actions.addWidget(self.send_file_button)
         actions.addWidget(self.cancel_transfer_button)
+        actions.addWidget(self.cancel_check_button)
         actions.addWidget(self.choose_media_button)
         info_layout.addLayout(info)
+        self.host_media_label = QLabel()
+        self.host_media_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.host_media_label.setWordWrap(True)
+        self.host_media_label.hide()
+        info_layout.addWidget(self.host_media_label)
         self.participants_label = QLabel()
         self.participants_label.setTextFormat(Qt.TextFormat.PlainText)
         self.participants_label.setWordWrap(True)
@@ -765,12 +780,19 @@ class MainWindow(QMainWindow):
         self.network.connect_to(ip, self.port_edit.value(), code, name)
 
     def _choose_media(self) -> None:
-        if self.state.role != Role.HOST:
+        if self.state.role == Role.CLIENT:
+            host = self.peers.get("host")
+            if not self.state.connected or not self.remote_media or not host or not host.ready:
+                self._show_error("Дождитесь, пока ведущий выберет видео")
+                return
+        elif self.state.role != Role.HOST:
             return
         if self.transfer_active:
             self._show_error("Дождитесь окончания передачи файла")
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите видео", "", "Видео (*.mp4 *.mkv *.mov *.avi *.m4v)")
+        title = (f"Найдите у себя видео: {self.remote_media.file_name}"
+                 if self.state.role == Role.CLIENT else "Выберите видео")
+        path, _ = QFileDialog.getOpenFileName(self, title, "", "Видео (*.mp4 *.mkv *.mov *.avi *.m4v);;Все файлы (*)")
         if not path:
             return
         self._start_media_load(path)
@@ -789,19 +811,28 @@ class MainWindow(QMainWindow):
 
     def _start_media_load(self, path: str | Path, *, from_host: bool = False) -> None:
         if self.state.role != Role.HOST and not (
-            self.state.role == Role.CLIENT and from_host and self.state.connected and self.remote_media
+            self.state.role == Role.CLIENT and self.state.connected and self.remote_media
         ):
+            return
+        if self.transfer_active or self._closing:
             return
         self._invalidate_commands()
         self._load_cancel.set()
         self._load_cancel = cancel_event = Event()
+        self._local_check = None
+        self._block_hashes = ()
+        self._host_file_signature = None
         self._load_generation += 1
         generation = self._load_generation
         self.local_media = None
         self.state.local_ready = False
         self._reset_media_match_state()
         self.local_media_path = Path(path)
+        self.player.stop()
         self._announce_media()
+        if self.state.role == Role.CLIENT and not from_host:
+            self._start_local_check(generation, self.local_media_path, cancel_event)
+            return
         self.player_status.setText("Открытие файла и расчёт SHA-256…")
         try:
             self.player.open(str(path))
@@ -812,13 +843,18 @@ class MainWindow(QMainWindow):
         signals.finished.connect(self._media_ready)
         signals.failed.connect(self._media_failed)
         deadline = time.monotonic() + 15
+        is_host = self.state.role == Role.HOST
 
         def work():
             name, size = basic_file_data(path)
-            fingerprint = calculate_fingerprint(path, cancel_event=cancel_event)
-            if size != Path(path).stat().st_size:
-                raise ValueError("Размер файла изменился во время проверки")
-            return generation, MediaInfo(name, size, 0, fingerprint), deadline
+            before = Path(path).stat()
+            blocks = [] if is_host else None
+            fingerprint = calculate_fingerprint(path, cancel_event=cancel_event, block_hashes=blocks)
+            after = Path(path).stat()
+            signature = (after.st_size, after.st_mtime_ns)
+            if size != after.st_size or signature != (before.st_size, before.st_mtime_ns):
+                raise ValueError("Файл изменился во время проверки")
+            return generation, MediaInfo(name, size, 0, fingerprint), deadline, (tuple(blocks or ()), signature)
 
         future = self.executor.submit(work)
         def done(result):
@@ -831,10 +867,83 @@ class MainWindow(QMainWindow):
                 signals.finished.emit(result.result())
         future.add_done_callback(done)
 
+    def _start_local_check(self, generation: int, path: Path, cancel_event: Event) -> None:
+        signals = WorkerSignals()
+        signals.finished.connect(self._local_media_verified)
+        signals.failed.connect(self._media_failed)
+        signals.progress.connect(self._local_check_progress)
+        job = LocalFileCheck(path, self.remote_media, cancel_event,
+                             lambda payload: self.network.send("media_check_request", payload),
+                             lambda percent: signals.progress.emit((generation, percent)))
+        self._local_check = job
+        self.player_status.setText("Проверяем выбранный файл с файлом ведущего…")
+        self._update_transfer_controls()
+
+        def work():
+            try:
+                media = job.run()
+                if not cancel_event.is_set():
+                    signals.finished.emit((generation, media))
+            except CancelledError:
+                return
+            except Exception as exc:
+                if not cancel_event.is_set():
+                    signals.failed.emit((generation, str(exc)))
+        self.executor.submit(work)
+
+    def _local_check_progress(self, result) -> None:
+        generation, percent = result
+        if generation == self._load_generation and self._local_check is not None and not self._closing:
+            self.player_status.setText(f"Проверяем выбранный файл с файлом ведущего: {percent}%")
+
+    def _local_media_verified(self, result) -> None:
+        generation, media = result
+        if generation != self._load_generation or self._closing or self._load_cancel.is_set():
+            return
+        self._local_check = None
+        self._update_transfer_controls()
+        try:
+            self.player.open(str(self.local_media_path))
+        except Exception as exc:
+            self._media_failed((generation, str(exc)))
+            return
+        self._media_ready((generation, media, time.monotonic() + 15))
+
+    def _cancel_local_check(self) -> None:
+        if self._local_check is None:
+            return
+        self._load_cancel.set()
+        self._local_check = None
+        self._load_generation += 1
+        self.local_media_path = None
+        self._update_transfer_controls()
+        self.player_status.setText("Проверка отменена. Выберите файл заново или получите его от ведущего.")
+
+    def _reply_to_media_check(self, payload: dict, peer_id: str) -> None:
+        reply = {key: payload[key] for key in ("check_id", "media_fingerprint", "offset")}
+        if (not self.local_media or not self.state.local_ready or not self.local_media_path
+                or payload["media_fingerprint"] != self.local_media.fingerprint):
+            reply["reason"] = "Ведущий сменил видео или ещё не готов. Выберите файл заново."
+        else:
+            try:
+                stat = self.local_media_path.stat()
+                if (stat.st_size, stat.st_mtime_ns) != self._host_file_signature:
+                    raise ValueError("Файл ведущего изменился. Ведущему нужно выбрать его заново.")
+                offset, count = payload["offset"], payload["count"]
+                blocks = self._block_hashes[offset:offset + count]
+                if len(blocks) != count:
+                    raise ValueError("Запрошенные блоки отсутствуют в файле ведущего")
+                reply["hashes"] = [block.hex() for block in blocks]
+            except (OSError, ValueError) as exc:
+                reply["reason"] = str(exc)
+        self.network.send("media_check_reply", reply, recipient_id=peer_id)
+
     def _media_failed(self, result) -> None:
         generation, reason = result
         if generation != self._load_generation or self._closing:
             return
+        self._local_check = None
+        self._update_transfer_controls()
         self.player.stop()
         self.local_media = None
         self.state.local_ready = False
@@ -844,7 +953,7 @@ class MainWindow(QMainWindow):
         self._show_error(str(reason))
 
     def _media_ready(self, result) -> None:
-        generation, media, deadline = result
+        generation, media, deadline = result[:3]
         if generation != self._load_generation or self._closing:
             return
         if self.state.role == Role.CLIENT and (
@@ -870,6 +979,8 @@ class MainWindow(QMainWindow):
             self._media_failed((generation, str(exc)))
             return
         self.local_media = media
+        if self.state.role == Role.HOST and len(result) == 4:
+            self._block_hashes, self._host_file_signature = result[3]
         self.state.local_ready = True
         self.stack.setCurrentWidget(self.player_page)
         self._announce_media()
@@ -879,6 +990,8 @@ class MainWindow(QMainWindow):
     def _announce_media(self, recipient_id: str | None = None) -> None:
         if not self._is_connected():
             return
+        if self.state.role == Role.HOST and self.local_media_path:
+            self.network.send("media_selected", {"file_name": self.local_media_path.name}, recipient_id=recipient_id)
         if self.local_media and self.state.local_ready:
             self.network.send("media_info", self.local_media.to_dict(), recipient_id=recipient_id)
         self.network.send("ready" if self.state.local_ready else "not_ready",
@@ -909,9 +1022,11 @@ class MainWindow(QMainWindow):
         elif self.state.local_ready:
             self.player_status.setText("Видео готово. Ожидание подключения и готовности участников…")
         else:
-            self.player_status.setText("Ожидание файла от ведущего. Подтвердите получение, когда появится предложение."
+            self.player_status.setText("Выберите совпадающее видео на этом компьютере или получите файл от ведущего."
                                        if self.state.role == Role.CLIENT else
                                        "Выберите видеофайл и передайте его участникам.")
+        if self._local_check is not None:
+            self.player_status.setText("Проверяем выбранный файл с файлом ведущего…")
         self._update_transfer_controls()
 
     def _force_media_match(self) -> None:
@@ -948,8 +1063,17 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 self.recipient_combo.setCurrentIndex(index)
         self.recipient_combo.setVisible(self.state.role == Role.HOST and bool(entries))
-        self.choose_media_button.setVisible(self.state.role == Role.HOST)
-        self.choose_media_button.setEnabled(not self.transfer_active)
+        client = self.state.role == Role.CLIENT
+        self.choose_media_button.setVisible(self.state.role in {Role.HOST, Role.CLIENT})
+        self.choose_media_button.setText("Выбрать файл на компьютере" if client else "Сменить файл")
+        host = self.peers.get("host")
+        self.choose_media_button.setEnabled(not self.transfer_active and (
+            not client or bool(self.state.connected and self.remote_media and host and host.ready)))
+        self.cancel_check_button.setVisible(self._local_check is not None)
+        self.host_media_label.setVisible(client)
+        host_name = self._host_selected_name or (self.remote_media.file_name if self.remote_media else None)
+        self.host_media_label.setText(f"Видео ведущего: {host_name}"
+                                     if client and host_name else "Ведущий ещё не выбрал видео")
         self.recipient_combo.setEnabled(not self.transfer_active)
         self.cancel_transfer_button.setVisible(self.transfer_active)
         self.transfer_progress.setVisible(self.transfer_active)
@@ -1091,6 +1215,13 @@ class MainWindow(QMainWindow):
             self._show_error(str(exc))
             return
         self.player.pause()
+        self._load_cancel.set()
+        self._local_check = None
+        self._load_generation += 1
+        self.local_media = None
+        self.state.local_ready = False
+        self._reset_media_match_state()
+        self._announce_media()
         self._transfer_receiver = receiver
         self.transfer_active = True
         self.transfer_timeout.start()
@@ -1160,19 +1291,30 @@ class MainWindow(QMainWindow):
         if peer_id not in self.peers:
             return
         peer = self.peers[peer_id]
-        if message.type == "media_info":
+        if message.type == "media_selected" and self.state.role == Role.CLIENT and peer_id == "host":
+            self._host_selected_name = p["file_name"]
+            self._update_transfer_controls()
+        elif message.type == "media_check_request" and self.state.role == Role.HOST:
+            self._reply_to_media_check(p, peer_id)
+        elif message.type == "media_check_reply" and self.state.role == Role.CLIENT and peer_id == "host":
+            if self._local_check is not None:
+                self._local_check.accept_reply(p)
+        elif message.type == "media_info":
+            previous = peer.media
             peer.media = MediaInfo.from_dict(p)
             peer.ready = False
             self.remote_media = peer.media
+            if self.state.role == Role.CLIENT:
+                self._host_selected_name = peer.media.file_name
             self.state.media_force_match = False
             self._invalidate_commands()
             self.player.pause()
-            if self.state.role == Role.CLIENT and (
-                not self.local_media or not media_matches(self.local_media, peer.media)
-            ):
+            if self.state.role == Role.CLIENT and (not previous or
+                    previous.file_size != peer.media.file_size or previous.fingerprint != peer.media.fingerprint):
                 if self.transfer_active or self._incoming_offer_id:
                     self._cleanup_transfer_state(send_cancel=True)
                 self._load_cancel.set()
+                self._local_check = None
                 self._load_generation += 1
                 self.player.stop()
                 self.local_media = None
@@ -1183,6 +1325,8 @@ class MainWindow(QMainWindow):
         elif message.type in {"ready", "not_ready"}:
             peer.ready = p['media_loaded'] and peer.media is not None
             if not peer.ready:
+                if self.state.role == Role.CLIENT and peer_id == "host":
+                    self._cancel_local_check()
                 self._invalidate_commands()
                 self.state.media_force_match = False
                 self.player.pause()
@@ -1742,6 +1886,9 @@ class MainWindow(QMainWindow):
 
     def _go_home(self) -> None:
         self._load_cancel.set()
+        self._local_check = None
+        self._block_hashes = ()
+        self._host_file_signature = None
         self._host_starting = False
         self.home_notice.clear()
         self.home_notice.hide()
@@ -1763,6 +1910,7 @@ class MainWindow(QMainWindow):
         self._clock_synced = False
         self.local_media = None
         self.remote_media = None
+        self._host_selected_name = None
         self.local_media_path = None
         self._reset_media_match_state()
         self._update_transfer_controls()

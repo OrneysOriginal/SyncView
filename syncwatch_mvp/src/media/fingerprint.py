@@ -8,7 +8,8 @@ from threading import Event
 BLOCK_SIZE = 1024 * 1024
 
 
-def calculate_fingerprint(path: str | Path, *, cancel_event: Event | None = None) -> str:
+def calculate_fingerprint(path: str | Path, *, cancel_event: Event | None = None,
+                          block_hashes: list[bytes] | None = None) -> str:
     file_path = Path(path)
     digest = hashlib.sha256()
     with file_path.open("rb") as fh:
@@ -19,4 +20,6 @@ def calculate_fingerprint(path: str | Path, *, cancel_event: Event | None = None
             if not block:
                 break
             digest.update(block)
+            if block_hashes is not None:
+                block_hashes.append(hashlib.sha256(block).digest())
     return digest.hexdigest()

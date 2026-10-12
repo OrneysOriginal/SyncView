@@ -83,13 +83,13 @@ def test_loading_is_cancelled_when_leaving_or_replacing_video(window_factory, qt
     second.write_bytes(b"second")
     entered, stopped = threading.Event(), threading.Event()
 
-    def slow_hash(path, *, cancel_event):
+    def slow_hash(path, *, cancel_event, block_hashes=None):
         if Path(path) == first:
             entered.set()
             assert cancel_event.wait(2)
             stopped.set()
             raise CancelledError()
-        return calculate_fingerprint(path, cancel_event=cancel_event)
+        return calculate_fingerprint(path, cancel_event=cancel_event, block_hashes=block_hashes)
 
     monkeypatch.setattr("src.ui.main_window.calculate_fingerprint", slow_hash)
     window._start_media_load(first)
@@ -181,11 +181,23 @@ entered = threading.Event()
 receiver = None
 
 if mode in {"hash", "quit"}:
-    def slow_hash(path, *, cancel_event=None):
+    def slow_hash(path, *, cancel_event=None, block_hashes=None):
         entered.set()
         assert (cancel_event or threading.Event()).wait(30), "Hash was never cancelled"
         raise CancelledError()
     main_window.calculate_fingerprint = slow_hash
+    window._start_media_load(movie)
+elif mode == "local_check":
+    from src.session.state import PeerState
+    media = MediaInfo("host-video.mp4", 5, 60000, hashlib.sha256(b"video").hexdigest())
+    window.state.role = Role.CLIENT
+    window.state.connected = True
+    window.remote_media = media
+    window.peers["host"] = PeerState("Host", media, True)
+    async def unanswered_request(kind, *args):
+        if kind == "media_check_request":
+            entered.set()
+    window.network.manager.send = unanswered_request
     window._start_media_load(movie)
 elif mode == "send":
     async def blocked_send(*args):
@@ -238,7 +250,7 @@ print("PROCESS_EXIT_OK", flush=True)
 '''
 
 
-@pytest.mark.parametrize("mode", ["idle", "hash", "send", "receive", "fullscreen", "quit"])
+@pytest.mark.parametrize("mode", ["idle", "hash", "send", "receive", "fullscreen", "quit", "local_check"])
 def test_closing_window_exits_process_with_background_work(tmp_path, mode):
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen", PYTHONDONTWRITEBYTECODE="1")
     process = subprocess.Popen([sys.executable, "-B", "-c", PROCESS_CHECK, mode, str(tmp_path)],

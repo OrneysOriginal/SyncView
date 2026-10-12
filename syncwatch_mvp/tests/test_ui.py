@@ -166,16 +166,11 @@ def test_double_click_does_not_emit_single_click(window_factory):
     assert not clicks and len(double_clicks) == 1
 
 
-def test_client_cannot_choose_load_send_or_seek(window_factory, monkeypatch):
-    from PySide6.QtWidgets import QFileDialog
-
+def test_client_cannot_send_or_seek(window_factory):
     client = ready(window_factory(), Role.CLIENT)
     client.player.seek(20000)
     media = client.local_media
-    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: pytest.fail("Client opened file dialog"))
     client._refresh_player_ui()
-    client._choose_media()
-    client._start_media_load("other.mp4")
     client._start_file_offer()
     client._seek_relative(5000)
     client._timeline_pressed()
@@ -186,7 +181,7 @@ def test_client_cannot_choose_load_send_or_seek(window_factory, monkeypatch):
     assert client.player.get_position_ms() == 20000
     assert not client.dragging and not client.transfer_active and not client._command_timers
     client.network.send.assert_not_called()
-    assert client.choose_media_button.isHidden() and client.send_file_button.isHidden()
+    assert not client.choose_media_button.isHidden() and client.send_file_button.isHidden()
     assert not any(button.isEnabled() for button in
                    (client.timeline, client.seek_back_button, client.seek_forward_button))
 

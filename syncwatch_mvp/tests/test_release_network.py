@@ -84,10 +84,15 @@ def test_ping_reply_is_personal_and_peer_cannot_control_host():
                     "file_name": "other.mp4", "file_size": 100, "fingerprint": "x"}, session_id=host.session_id)))
                 await first.send(encode_message(Message("seek_complete", {"seek_id": 1,
                     "media_fingerprint": "x"}, session_id=host.session_id)))
+                await first.send(encode_message(Message("media_selected", {"file_name": "spoof.mp4"},
+                                                       session_id=host.session_id)))
+                await first.send(encode_message(Message("media_check_reply", {"check_id": "id",
+                    "media_fingerprint": "x", "offset": 0, "hashes": ["0" * 64]}, session_id=host.session_id)))
                 await first.send(encode_message(Message("ready", {"media_loaded": True}, session_id=host.session_id)))
                 message = await event(inbox, "ready")
                 assert message.sender_id == id1
-                assert not any(item.type in {"play", "seek", "file_offer", "seek_complete"} for item in list(inbox._queue))
+                assert not any(item.type in {"play", "seek", "file_offer", "seek_complete", "media_selected",
+                                             "media_check_reply"} for item in list(inbox._queue))
             finally:
                 await first.close()
                 await second.close()

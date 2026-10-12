@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 
 @dataclass(slots=True)

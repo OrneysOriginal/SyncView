@@ -114,6 +114,7 @@ def test_invalid_seek_confirmation_is_rejected(kind, payload):
         decode_message(encode_message(Message(kind, payload)))
 
 
-def test_previous_protocol_cannot_join_confirmation_session():
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_previous_protocol_cannot_join_confirmation_session(version):
     with pytest.raises(ValueError, match="Несовместимая"):
-        decode_message(encode_message(Message("join", {"room_code": "123456"}, protocol_version=2)))
+        decode_message(encode_message(Message("join", {"room_code": "123456"}, protocol_version=version)))
